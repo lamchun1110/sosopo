@@ -17,6 +17,8 @@ services:
       # Keep the unauthenticated starter app reachable only from this host.
       # Use a reverse proxy with authentication before exposing it publicly.
       - "127.0.0.1:8088:8080"
+    networks:
+      - frontend
     environment:
       SOSOPO_DATA_DIR: /data
       DATABASE_URL: ${DATABASE_URL:-}
@@ -175,3 +177,7 @@ services:
     volumes:
       - ./data:/data:ro
       - ./backups:/backups
+
+networks:
+  frontend:
+    external: true
