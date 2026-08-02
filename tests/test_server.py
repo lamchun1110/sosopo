@@ -7,11 +7,13 @@ import os
 import shutil
 import tempfile
 import unittest
+from io import BytesIO
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
+from PIL import Image
 
 
 class SosopoTest(unittest.TestCase):
@@ -130,6 +132,35 @@ class SosopoTest(unittest.TestCase):
         self.assertEqual(s.detected_image_type(b"\xff\xd8\xff\xe0rest"), "image/jpeg")
         self.assertEqual(s.detected_image_type(b"RIFFxxxxWEBPrest"), "image/webp")
         self.assertIsNone(s.detected_image_type(b"<script>alert(1)</script>"))
+
+    def test_image_decoder_checks_real_image_content(self) -> None:
+        s = self.server
+        buffer = BytesIO()
+        Image.new("RGB", (1, 1), "white").save(buffer, format="PNG")
+        self.assertEqual(s.inspect_image(buffer.getvalue(), "image/png"), (1, 1))
+        with self.assertRaisesRegex(ValueError, "cannot be decoded"):
+            s.inspect_image(b"not an image", "image/png")
+
+    def test_non_retryable_provider_failure_goes_to_dead_letter_state(self) -> None:
+        s = self.server
+        with s.db() as connection:
+            post_id = s.insert_id(connection, "INSERT INTO posts (body, channel, state, attempts, scheduled_for, created_at) VALUES (?, ?, 'publishing', 1, ?, ?)", ("hello", "Telegram", s.now(), s.now()))
+        original_publish = s.publish
+        s.publish = lambda post, account=None: (_ for _ in ()).throw(s.ProviderError("invalid media", retryable=False))
+        try:
+            s.deliver(post_id)
+        finally:
+            s.publish = original_publish
+        with s.db() as connection:
+            post = connection.execute("SELECT state, last_error FROM posts WHERE id = ?", (post_id,)).fetchone()
+        self.assertEqual(post["state"], "failed")
+        self.assertIn("invalid media", post["last_error"])
+
+    def test_retry_after_is_bounded(self) -> None:
+        s = self.server
+        self.assertEqual(s.parse_retry_after("90"), 90)
+        self.assertEqual(s.parse_retry_after("999999"), s.RETRY_MAX_SECONDS)
+        self.assertIsNone(s.parse_retry_after("tomorrow"))
 
     def test_disabled_connection_never_calls_provider(self) -> None:
         s = self.server

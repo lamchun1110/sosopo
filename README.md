@@ -31,7 +31,7 @@ Compose starts two services: `sosopo` serves the authenticated web/API interface
 
 The worker emits a database heartbeat on every delivery poll. Compose marks it unhealthy if three polling periods elapse without a heartbeat; check both services with `docker compose ps` and inspect failures with `docker compose logs sosopo-worker`.
 
-Transient delivery failures are retried with exponential backoff (30 seconds, 60 seconds, then 120 seconds) before a post is marked failed after three attempts. Review failed posts and provider errors in the dashboard; rescheduling a failed post resets its attempt counter.
+Transient delivery failures are retried with exponential backoff (30 seconds, 60 seconds, then 120 seconds) before a post is moved to the failed-post queue after three attempts. HTTP 429 and 5xx responses are retryable; a provider `Retry-After` value is honoured up to one hour. Other provider 4xx responses are placed in the failed-post queue immediately to avoid repeatedly sending a known-invalid request. Review the delivery history, correct the issue, and use **Retry failed delivery** to reset the counter and queue it again.
 
 Each delivery has a five-minute worker lease. If a worker dies during a delivery, the lease is recovered and the post is retried. This provides durable at-least-once delivery; a provider request that succeeded immediately before a process crash can be delivered twice unless that provider/account supports an idempotency mechanism. Review provider-side posts when recovering a worker after an outage.
 
@@ -339,10 +339,10 @@ curl -fsS http://127.0.0.1:8088/api/health
 
 1. Add provider OAuth account discovery and refresh-token flows. Manual encrypted credential entry, rotation, and multi-target publishing are available today.
 2. Add invitation delivery, role-change UI, and richer audit-event filtering/export. User creation, disable/revocation, and audit logging are available today.
-3. Add provider-specific media validation (dimensions, aspect ratios, carousels, video, and alt text). Character limits and Instagram image requirements are enforced today.
-4. Add provider rate-limit handling, provider-native idempotency where available, and a dedicated dead-letter/retry interface. The worker already has durable claims, backoff, lease recovery, and per-post delivery history.
-5. Add automated adapter tests against provider sandboxes and practice restores against each external database backend before public deployment.
-6. Add metrics export and a dependency-update policy. Security headers, process-local rate limits, structured logs, secret-file configuration, and image-byte validation are already included.
+3. Add carousels, video, alt text, and provider-specific rendition rules. Sosopo now decodes uploaded images before storage, rejects corrupt/unsafe payloads, and keeps the existing character-limit and Instagram image requirement.
+4. Add provider-native idempotency keys where each API supports them. Sosopo already classifies retryable HTTP failures, honours `Retry-After`, uses durable claims/leases, keeps delivery history, and includes a user-owned failed-post retry interface.
+5. Add automated adapter tests against provider sandboxes and practice restores against each external database backend before public deployment. Live provider verification is deliberately deferred for deployments without provider credentials.
+6. Add alert rules and dashboard templates. Sosopo includes an opt-in authenticated Prometheus endpoint and a weekly Dependabot policy.
 
 Pin and deliberately upgrade images and provider integrations in a test environment; avoid automatic upgrades for a service that holds publishing credentials.
 
@@ -359,6 +359,14 @@ curl -fsS http://127.0.0.1:8088/api/health
 ```
 
 The workflow builds the image and runs the unit suite, but it deliberately does not use real provider credentials. Keep provider sandbox tests and any deployment secrets in the CI provider's secret store.
+
+## Metrics
+
+Set a long random `SOSOPO_METRICS_TOKEN` to enable the private Prometheus-format `/metrics` endpoint. It reports post counts by state, delivery totals by result, and worker heartbeat health. Requests must include `Authorization: Bearer <SOSOPO_METRICS_TOKEN>`; when the token is empty or incorrect, the endpoint returns 404. Do not expose this endpoint publicly—have the scraper use the Docker network or a proxy allow-list.
+
+```sh
+curl -fsS -H "Authorization: Bearer $SOSOPO_METRICS_TOKEN" http://127.0.0.1:8088/metrics
+```
 
 Sosopo applies a process-local request limit of 10 authentication attempts and 60 authenticated writes per source IP per minute. Put a rate-limiting reverse proxy or Cloudflare Access in front of replicas; the built-in guard is intentionally a final line of defense, not a distributed rate-limit service.
 

@@ -6,6 +6,7 @@ import base64
 import binascii
 import hashlib
 import ipaddress
+import io
 import json
 import logging
 import mimetypes
@@ -29,6 +30,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from cryptography.fernet import Fernet, InvalidToken
 import jwt
 from jwt import PyJWKClient
+from PIL import Image, UnidentifiedImageError
 
 
 def environment_value(name: str) -> str:
@@ -50,6 +52,7 @@ DATABASE_URL = environment_value("DATABASE_URL")
 UPLOADS_DIR = DATA_DIR / "uploads"
 MAX_POST_LENGTH = 5_000
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_PIXELS = 25_000_000
 MAX_ATTEMPTS = 3
 POLL_SECONDS = 15
 RETRY_BASE_SECONDS = 30
@@ -70,7 +73,12 @@ RATE_LIMIT_LOCK = threading.Lock()
 
 
 class ProviderError(Exception):
-    """A safe-to-display provider delivery error."""
+    """A safe-to-display provider delivery error with retry guidance."""
+
+    def __init__(self, message: str, *, retryable: bool = True, retry_after: int | None = None) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.retry_after = retry_after
 
 
 def now() -> str:
@@ -88,6 +96,22 @@ def detected_image_type(content: bytes) -> str | None:
     if len(content) >= 12 and content.startswith(b"RIFF") and content[8:12] == b"WEBP":
         return "image/webp"
     return None
+
+
+def inspect_image(content: bytes, declared_type: str) -> tuple[int, int]:
+    """Decode uploaded media before persisting it, avoiding disguised/corrupt images."""
+    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    try:
+        with Image.open(io.BytesIO(content)) as image:
+            image.verify()
+        with Image.open(io.BytesIO(content)) as image:
+            width, height = image.size
+            actual = Image.MIME.get(image.format or "")
+    except (Image.DecompressionBombError, UnidentifiedImageError, OSError, ValueError) as error:
+        raise ValueError("Image content is corrupt, unsafe, or cannot be decoded.") from error
+    if actual != declared_type or width < 1 or height < 1:
+        raise ValueError("Image content does not match the declared media type.")
+    return width, height
 
 
 def token_is_expired(value: object) -> bool:
@@ -570,9 +594,11 @@ def request_json(url: str, payload: dict[str, Any], headers: dict[str, str] | No
             return json.loads(response.read() or b"{}")
     except HTTPError as error:
         body = error.read().decode(errors="replace")[:500]
-        raise ProviderError(f"Provider rejected the post ({error.code}): {body}") from error
+        retry_after = parse_retry_after(error.headers.get("Retry-After", ""))
+        retryable = error.code == HTTPStatus.TOO_MANY_REQUESTS or error.code >= HTTPStatus.INTERNAL_SERVER_ERROR
+        raise ProviderError(f"Provider rejected the post ({error.code}): {body}", retryable=retryable, retry_after=retry_after) from error
     except URLError as error:
-        raise ProviderError(f"Provider could not be reached: {error.reason}") from error
+        raise ProviderError(f"Provider could not be reached: {error.reason}", retryable=True) from error
 
 
 def request_form(url: str, payload: dict[str, str]) -> dict[str, Any]:
@@ -581,9 +607,19 @@ def request_form(url: str, payload: dict[str, str]) -> dict[str, Any]:
         with urlopen(request, timeout=30) as response:
             return json.loads(response.read() or b"{}")
     except HTTPError as error:
-        raise ProviderError(f"Provider rejected the post ({error.code}): {error.read().decode(errors='replace')[:500]}") from error
+        retry_after = parse_retry_after(error.headers.get("Retry-After", ""))
+        retryable = error.code == HTTPStatus.TOO_MANY_REQUESTS or error.code >= HTTPStatus.INTERNAL_SERVER_ERROR
+        raise ProviderError(f"Provider rejected the post ({error.code}): {error.read().decode(errors='replace')[:500]}", retryable=retryable, retry_after=retry_after) from error
     except URLError as error:
-        raise ProviderError(f"Provider could not be reached: {error.reason}") from error
+        raise ProviderError(f"Provider could not be reached: {error.reason}", retryable=True) from error
+
+
+def parse_retry_after(value: str) -> int | None:
+    """Accept only bounded Retry-After delay seconds from a provider response."""
+    try:
+        return min(max(int(value), 1), RETRY_MAX_SECONDS)
+    except (TypeError, ValueError):
+        return None
 
 
 def telegram_request(token: str, method: str, fields: dict[str, str], image: Path | None = None) -> dict[str, Any]:
@@ -709,7 +745,7 @@ def deliver(post_id: int) -> None:
         ).fetchall()]
     if not targets:
         targets = [None]
-    failures: list[str] = []
+    failures: list[ProviderError] = []
     delivered: list[str] = []
     for target in targets:
         try:
@@ -721,16 +757,18 @@ def deliver(post_id: int) -> None:
                 with db() as connection:
                     connection.execute("UPDATE post_targets SET state = 'published', external_id = ?, last_error = NULL WHERE post_id = ? AND connection_id = ?", (external_id, post_id, target["connection_id"]))
         except ProviderError as error:
-            failures.append(str(error)[:500])
+            failures.append(error)
             if target:
                 with db() as connection:
                     connection.execute("UPDATE post_targets SET state = 'failed', last_error = ? WHERE post_id = ? AND connection_id = ?", (str(error)[:500], post_id, target["connection_id"]))
     if failures:
         with db() as connection:
             attempts = connection.execute("SELECT attempts FROM posts WHERE id = ?", (post_id,)).fetchone()[0]
-            state = "failed" if attempts >= MAX_ATTEMPTS else "scheduled"
-            detail = "; ".join(failures)[:500]
-            retry_at = (datetime.now(UTC) + timedelta(seconds=min(RETRY_BASE_SECONDS * (2 ** max(attempts - 1, 0)), RETRY_MAX_SECONDS))).isoformat()
+            retryable = any(error.retryable for error in failures)
+            state = "failed" if attempts >= MAX_ATTEMPTS or not retryable else "scheduled"
+            detail = "; ".join(str(error) for error in failures)[:500]
+            retry_delay = max([RETRY_BASE_SECONDS * (2 ** max(attempts - 1, 0)), *(error.retry_after or 0 for error in failures)])
+            retry_at = (datetime.now(UTC) + timedelta(seconds=min(retry_delay, RETRY_MAX_SECONDS))).isoformat()
             connection.execute("UPDATE posts SET state = ?, publishing_started_at = NULL, scheduled_for = CASE WHEN ? = 'scheduled' THEN ? ELSE scheduled_for END, last_error = ? WHERE id = ?", (state, state, retry_at, detail, post_id))
             connection.execute("INSERT INTO deliveries (post_id, provider, status, detail, created_at) VALUES (?, ?, 'failed', ?, ?)", (post_id, post["channel"], detail, now()))
         return
@@ -862,6 +900,27 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        if path == "/metrics":
+            token = config("SOSOPO_METRICS_TOKEN")
+            authorization = self.headers.get("Authorization", "")
+            if not token or not secrets.compare_digest(authorization, f"Bearer {token}"):
+                self._json({"error": "Not found."}, HTTPStatus.NOT_FOUND); return
+            with db() as connection:
+                states = {row["state"]: row["count"] for row in connection.execute("SELECT state, COUNT(*) AS count FROM posts GROUP BY state").fetchall()}
+                deliveries = {row["status"]: row["count"] for row in connection.execute("SELECT status, COUNT(*) AS count FROM deliveries GROUP BY status").fetchall()}
+            lines = ["# HELP sosopo_posts Number of posts by state.", "# TYPE sosopo_posts gauge"]
+            lines.extend(f'sosopo_posts{{state="{state}"}} {count}' for state, count in sorted(states.items()))
+            lines.extend(["# HELP sosopo_deliveries_total Delivery attempts by result.", "# TYPE sosopo_deliveries_total counter"])
+            lines.extend(f'sosopo_deliveries_total{{status="{status}"}} {count}' for status, count in sorted(deliveries.items()))
+            lines.extend(["# HELP sosopo_worker_healthy Worker heartbeat health (1 healthy, 0 unhealthy).", "# TYPE sosopo_worker_healthy gauge", f"sosopo_worker_healthy {int(worker_healthy())}"])
+            body = ("\n".join(lines) + "\n").encode()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path == "/api/setup-status":
             with db() as connection:
                 has_user = connection.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
@@ -1151,6 +1210,7 @@ class Handler(SimpleHTTPRequestHandler):
                 actual_type = detected_image_type(image)
                 if actual_type != content_type:
                     self._json({"error": "Image bytes do not match the declared content type."}, HTTPStatus.BAD_REQUEST); return
+                inspect_image(image, actual_type)
                 filename = f"{uuid.uuid4().hex}{IMAGE_TYPES[actual_type]}"
                 self._json({"url": store_media(filename, actual_type, image)}, HTTPStatus.CREATED); return
             if path == "/api/posts":
@@ -1196,6 +1256,16 @@ class Handler(SimpleHTTPRequestHandler):
                         self._json({"error": "Post not found or already published."}, HTTPStatus.NOT_FOUND); return
                     connection.execute("UPDATE posts SET state = 'scheduled', scheduled_for = ? WHERE id = ? AND user_id = ?", (now(), post_id, session["user_id"]))
                 audit(session["user_id"], "post.queued", "post", post_id, "Queued for immediate delivery", self._source_ip())
+                self._json({"status": "queued"}, HTTPStatus.ACCEPTED); return
+            if path.startswith("/api/posts/") and path.endswith("/retry"):
+                post_id = int(path.split("/")[3])
+                with db() as connection:
+                    cursor = connection.execute("UPDATE posts SET state = 'scheduled', scheduled_for = ?, scheduled_timezone = 'UTC', attempts = 0, publishing_started_at = NULL, last_error = NULL WHERE id = ? AND user_id = ? AND state = 'failed'", (now(), post_id, session["user_id"]))
+                    if cursor.rowcount == 1:
+                        connection.execute("UPDATE post_targets SET state = 'pending', last_error = NULL WHERE post_id = ? AND state != 'published'", (post_id,))
+                if cursor.rowcount != 1:
+                    self._json({"error": "Only one of your failed posts can be retried."}, HTTPStatus.NOT_FOUND); return
+                audit(session["user_id"], "post.retried", "post", post_id, "Manually retried failed delivery", self._source_ip())
                 self._json({"status": "queued"}, HTTPStatus.ACCEPTED); return
             self._json({"error": "Not found."}, HTTPStatus.NOT_FOUND)
         except (json.JSONDecodeError, ValueError) as error:
