@@ -94,6 +94,43 @@ https://your-sosopo-domain.example/api/social-oauth/callback
 
 For Meta, request the Page and Instagram publishing permissions listed in `.env.example` and ensure the signing-in person manages the Page. Meta production use can require app review and business verification. For X, configure OAuth 2.0 Authorization Code with PKCE and user-context posting access. Telegram continues to use a BotFather token and channel/chat ID because its Bot API has no equivalent account-approval flow.
 
+### Create provider apps and bots
+
+You only need to create a provider app or bot for the channels you intend to publish to. Do this once for the Sosopo instance, then users connect their own approved Pages/accounts from the dashboard.
+
+#### Facebook Pages and Instagram
+
+1. Create a Meta developer app and add Facebook Login plus the Pages/Instagram APIs.
+2. Add `https://your-sosopo-domain.example/api/social-oauth/callback` as the exact valid OAuth redirect URI.
+3. Set `FACEBOOK_OAUTH_CLIENT_ID` and `FACEBOOK_OAUTH_CLIENT_SECRET` in `.env` (prefer their `_FILE` equivalents in production).
+4. Request `pages_show_list`, `pages_read_engagement`, `pages_manage_posts`, `instagram_basic`, and `instagram_content_publish` in the Meta app. The person connecting must manage the Facebook Page; Instagram publishing additionally needs a linked professional Instagram account.
+5. For production users outside your Meta app roles, complete any Meta app review and business-verification requirements before enabling the connection button.
+
+Users then select **Connect** beside Facebook in Sosopo, sign in to Meta, approve the requested access, and choose from the discovered Pages. Sosopo automatically adds linked Instagram professional accounts. Do not ask users for their Facebook password or place a Page token in a screenshot, ticket, or chat message.
+
+#### Threads
+
+1. Create a Threads developer app.
+2. Register the same Sosopo social OAuth callback URL.
+3. Set `THREADS_OAUTH_CLIENT_ID` and `THREADS_OAUTH_CLIENT_SECRET`.
+4. Enable `threads_basic` and `threads_content_publish` for the app, then use **Connect** beside Threads.
+
+#### X
+
+1. Create an X developer project/app with user-context posting access.
+2. Configure OAuth 2.0 Authorization Code with PKCE and register the Sosopo callback URL.
+3. Set `X_OAUTH_CLIENT_ID` and `X_OAUTH_CLIENT_SECRET`.
+4. Enable at least `tweet.read`, `tweet.write`, `users.read`, and `offline.access`, then use **Connect** beside X.
+
+#### Telegram
+
+1. Open `@BotFather` in Telegram and run `/newbot`.
+2. Save the bot token as a secret. Treat it like a password and rotate it with BotFather if exposed.
+3. Add the bot as an administrator of the target channel or group, with permission to post messages.
+4. In Sosopo, choose Telegram under **Connect an account**, enter the bot token, and enter the chat/channel ID (for a public channel this can be `@channel_name`).
+
+Telegram does not support a Page-style OAuth approval flow for this use case, so its bot token is entered manually. [Telegram’s BotFather tutorial](https://core.telegram.org/bots/tutorial) explains bot creation and token rotation.
+
 API clients may include `token_expires_at` as a future ISO 8601 timestamp with a timezone. Expired accounts cannot be selected for a new post and the worker fails them before sending any provider request; the dashboard displays the expiry when present.
 
 Disable a connection with `POST /api/connections/{id}/disable` (CSRF protected). It is retained for delivery history but cannot be selected for new posts; any pending target using it fails safely rather than falling back to unrelated environment credentials. Rotate the provider credential at the provider as well.
@@ -102,11 +139,11 @@ Replace an expired or compromised credential using the dashboard's **Rotate toke
 
 | Provider | Required variables | Current publishing mode |
 | --- | --- | --- |
-| Facebook Pages | `FACEBOOK_PAGE_ID`, `FACEBOOK_PAGE_ACCESS_TOKEN` | Text posts and one public-image post. |
-| Instagram | `INSTAGRAM_ACCOUNT_ID`, `INSTAGRAM_ACCESS_TOKEN`, `SOSOPO_PUBLIC_URL` for images | One image feed post. Image is required. |
-| Threads | `THREADS_USER_ID`, `THREADS_ACCESS_TOKEN`; `SOSOPO_PUBLIC_URL` for images | Text or one public-image post. |
-| X | `X_ACCESS_TOKEN` | Text or one image post. Token needs `post.write`. |
-| Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Text or one image message; the bot must be an administrator of the target channel/group. |
+| Facebook Pages | OAuth client credentials or `FACEBOOK_PAGE_ID`, `FACEBOOK_PAGE_ACCESS_TOKEN` | Text, image, and multi-image posts. |
+| Instagram | Meta OAuth client credentials or `INSTAGRAM_ACCOUNT_ID`, `INSTAGRAM_ACCESS_TOKEN`; `SOSOPO_PUBLIC_URL` for images | Image and carousel posts. Image is required. |
+| Threads | OAuth client credentials or `THREADS_USER_ID`, `THREADS_ACCESS_TOKEN`; `SOSOPO_PUBLIC_URL` for images | Text, image, and carousel posts. |
+| X | OAuth client credentials or `X_ACCESS_TOKEN` | Text and up to four images. |
+| Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` or a manually connected bot | Text and multi-image messages; the bot must be an administrator of the target channel/group. |
 
 Facebook and Instagram use `META_GRAPH_BASE_URL` (default shown in `.env.example`); Threads uses `THREADS_API_BASE_URL`. Keep API versions configurable and review provider changelogs before upgrading.
 
