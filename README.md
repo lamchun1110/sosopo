@@ -74,7 +74,11 @@ Local disk (`SOSOPO_STORAGE_BACKEND=local`) is the default and stores uploads in
 
 ### Account connections
 
-One owner can hold multiple Facebook Pages, Instagram accounts, Threads profiles, X accounts, or Telegram channels. Connection secrets are encrypted with Fernet before being written to the database and are never returned by the API. A post may select multiple connected accounts of its chosen provider using `connection_ids`; when no account is selected, Sosopo uses the legacy environment credentials.
+One owner can hold multiple Facebook Pages, Instagram accounts, Threads profiles, X accounts, or Telegram channels. Connection secrets are encrypted with Fernet before being written to the database and are never returned by the API. The composer can select several platforms and one or more connected accounts per platform in a single post. Delivery is independently recorded for each account, so a failure on one destination can be retried without reposting to accounts that already succeeded. A single-platform post may still use legacy environment credentials when no connected account is selected.
+
+Posts can include up to 10 images, with provider-specific limits checked before saving (X accepts up to 4). Sosopo stores the attachments in their selected order and sends provider carousel/media-group requests where supported. Images are decoded and validated on upload. Use public HTTPS media storage because providers must be able to fetch scheduled attachments.
+
+The publish timezone is an IANA timezone dropdown populated by the browser (for example `Asia/Hong_Kong`). Sosopo converts the chosen local date/time to UTC and stores the selected timezone with the post.
 
 The dashboard's **Connected accounts** form creates and disables account records. The underlying `POST /api/connections` API requires a signed-in session plus its CSRF token and accepts a provider, display name, external account ID, optional settings, and provider secrets. Use `access_token` for Facebook, Instagram, Threads, and X; use `bot_token` for Telegram. `external_account_id` is the Page/account/profile ID (or Telegram chat/channel ID). OAuth account discovery remains future work; manual encrypted token entry is available today.
 

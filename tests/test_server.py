@@ -271,6 +271,29 @@ class SosopoTest(unittest.TestCase):
         s.validate_post("Instagram", "caption", "/uploads/photo.jpg")
         s.validate_post("Telegram", "x" * 4096, None)
 
+    def test_provider_media_limits_and_ordered_post_attachments(self) -> None:
+        s = self.server
+        with self.assertRaisesRegex(ValueError, "X supports up to 4"):
+            s.validate_post("X", "caption", "/uploads/one.png", 5)
+        with s.db() as connection:
+            post_id = s.insert_id(connection, "INSERT INTO posts (body, channel, state, image_url, created_at) VALUES (?, ?, ?, ?, ?)", ("caption", "Facebook", "draft", "/uploads/first.png", s.now()))
+            connection.execute("INSERT INTO post_media (post_id, media_url, position) VALUES (?, ?, ?)", (post_id, "/uploads/first.png", 0))
+            connection.execute("INSERT INTO post_media (post_id, media_url, position) VALUES (?, ?, ?)", (post_id, "/uploads/second.png", 1))
+        self.assertEqual(s.post_media_urls({"id": post_id, "image_url": "/uploads/first.png"}), ["/uploads/first.png", "/uploads/second.png"])
+
+    def test_target_account_provider_overrides_post_default_provider(self) -> None:
+        s = self.server
+        post = {"id": 0, "channel": "Facebook", "body": "hello", "image_url": None}
+        account = {"provider": "X", "external_account_id": "profile", "encrypted_secrets": s.encrypt_secrets({"access_token": "token"}), "token_expires_at": None}
+        original_request = s.request_json
+        calls: list[str] = []
+        s.request_json = lambda url, payload, headers=None: calls.append(url) or {"data": {"id": "remote"}}
+        try:
+            self.assertEqual(s.publish(post, account), "remote")
+        finally:
+            s.request_json = original_request
+        self.assertEqual(calls, ["https://api.x.com/2/tweets"])
+
     def test_initial_setup_marker_is_unique(self) -> None:
         s = self.server
         with s.db() as connection:

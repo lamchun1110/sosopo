@@ -53,6 +53,7 @@ UPLOADS_DIR = DATA_DIR / "uploads"
 MAX_POST_LENGTH = 5_000
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_IMAGE_PIXELS = 25_000_000
+MAX_POST_MEDIA = 10
 MAX_ATTEMPTS = 3
 POLL_SECONDS = 15
 RETRY_BASE_SECONDS = 30
@@ -67,6 +68,7 @@ WRITE_REQUESTS_PER_MINUTE = 60
 CHANNELS = ("Facebook", "Instagram", "Threads", "X", "Telegram")
 IMAGE_TYPES = {"image/gif": ".gif", "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 CHANNEL_CHARACTER_LIMITS = {"Facebook": 5_000, "Instagram": 2_200, "Threads": 500, "X": 280, "Telegram": 4_096}
+CHANNEL_MEDIA_LIMITS = {"Facebook": 10, "Instagram": 10, "Threads": 10, "X": 4, "Telegram": 10}
 LOGGER = logging.getLogger("sosopo")
 RATE_LIMITS: dict[tuple[str, str], list[float]] = {}
 RATE_LIMIT_LOCK = threading.Lock()
@@ -126,13 +128,15 @@ def token_is_expired(value: object) -> bool:
         return True
 
 
-def validate_post(channel: str, body: str, image_url: str | None) -> None:
+def validate_post(channel: str, body: str, image_url: str | None, image_count: int = 0) -> None:
     if channel not in CHANNELS:
         raise ValueError("Choose a supported provider.")
     if len(body) > CHANNEL_CHARACTER_LIMITS[channel]:
         raise ValueError(f"{channel} posts must be {CHANNEL_CHARACTER_LIMITS[channel]} characters or fewer.")
     if channel == "Instagram" and not image_url:
         raise ValueError("Instagram publishing requires an image.")
+    if image_count > CHANNEL_MEDIA_LIMITS[channel]:
+        raise ValueError(f"{channel} supports up to {CHANNEL_MEDIA_LIMITS[channel]} images per post.")
 
 
 def allowed_request(client: str, scope: str, limit: int) -> bool:
@@ -333,6 +337,17 @@ def setup_database() -> None:
             )"""
         )
         connection.execute(
+            """CREATE TABLE IF NOT EXISTS post_media (
+                id %s,
+                post_id INTEGER NOT NULL,
+                media_url TEXT NOT NULL,
+                alt_text TEXT,
+                position INTEGER NOT NULL,
+                FOREIGN KEY(post_id) REFERENCES posts(id),
+                UNIQUE(post_id, position)
+            )""" % id_column
+        )
+        connection.execute(
             """CREATE TABLE IF NOT EXISTS oidc_states (
                 state TEXT PRIMARY KEY,
                 nonce TEXT NOT NULL,
@@ -387,6 +402,7 @@ def setup_database() -> None:
             )"""
         )
         connection.execute("CREATE INDEX IF NOT EXISTS posts_due_delivery ON posts(state, scheduled_for)")
+        connection.execute("CREATE INDEX IF NOT EXISTS post_media_post ON post_media(post_id, position)")
         connection.execute("CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at)")
         connection.execute("CREATE INDEX IF NOT EXISTS deliveries_post ON deliveries(post_id, created_at)")
         if connection.execute("SELECT COUNT(*) FROM posts").fetchone()[0] == 0:
@@ -586,6 +602,18 @@ def media_bytes(image_url: str) -> bytes:
     return media_client().get_object(Bucket=bucket, Key=media_key(Path(urlparse(image_url).path).name))["Body"].read()
 
 
+def post_media_urls(post: dict[str, Any]) -> list[str]:
+    """Return ordered attachments while retaining compatibility with old single-image posts."""
+    urls = post.get("media_urls")
+    if isinstance(urls, list):
+        return [str(url) for url in urls]
+    if "id" not in post:
+        return [post["image_url"]] if post.get("image_url") else []
+    with db() as connection:
+        rows = connection.execute("SELECT media_url FROM post_media WHERE post_id = ? ORDER BY position", (post["id"],)).fetchall()
+    return [row["media_url"] for row in rows] or ([post["image_url"]] if post.get("image_url") else [])
+
+
 def request_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None) -> dict[str, Any]:
     data = json.dumps(payload).encode()
     request = Request(url, data=data, method="POST", headers={"Content-Type": "application/json", **(headers or {})})
@@ -645,7 +673,9 @@ def telegram_request(token: str, method: str, fields: dict[str, str], image: Pat
 
 
 def publish(post: dict[str, Any], account: dict[str, Any] | None = None) -> str:
-    channel, body, image_url = post["channel"], post["body"], post.get("image_url")
+    channel = str(account.get("provider") or post["channel"]) if account else post["channel"]
+    body, image_urls = post["body"], post_media_urls(post)
+    image_url = image_urls[0] if image_urls else None
     if account and token_is_expired(account.get("token_expires_at")):
         raise ProviderError("This provider account token has expired. Reconnect or rotate it before publishing.")
     secrets_for_account = decrypt_secrets(account["encrypted_secrets"]) if account else {}
@@ -656,22 +686,28 @@ def publish(post: dict[str, Any], account: dict[str, Any] | None = None) -> str:
         token, chat_id = credential("bot_token", "TELEGRAM_BOT_TOKEN"), account_id or credential("chat_id", "TELEGRAM_CHAT_ID")
         if not token or not chat_id:
             raise ProviderError("Telegram needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
-        fields = {"chat_id": chat_id, "caption" if image_url else "text": body}
-        image = UPLOADS_DIR / Path(image_url).name if image_url and storage_backend() == "local" else None
-        if image_url and storage_backend() == "s3":
-            fields["photo"] = public_image_url(image_url)
-        result = telegram_request(token, "sendPhoto" if image_url else "sendMessage", fields, image)
-        return str(result["result"]["message_id"])
+        if not image_urls:
+            result = telegram_request(token, "sendMessage", {"chat_id": chat_id, "text": body})
+            return str(result["result"]["message_id"])
+        message_ids: list[str] = []
+        for index, url in enumerate(image_urls):
+            fields = {"chat_id": chat_id, "caption": body if index == 0 else ""}
+            image = UPLOADS_DIR / Path(url).name if storage_backend() == "local" else None
+            if storage_backend() == "s3":
+                fields["photo"] = public_image_url(url)
+            result = telegram_request(token, "sendPhoto", fields, image)
+            message_ids.append(str(result["result"]["message_id"]))
+        return ",".join(message_ids)
     if channel == "X":
         token = credential("access_token", "X_ACCESS_TOKEN")
         if not token:
             raise ProviderError("X needs X_ACCESS_TOKEN with post.write permission.")
         media_ids: list[str] = []
-        if image_url:
-            image_name = Path(urlparse(image_url).path).name
-            result = request_json("https://api.x.com/2/media/upload", {"media": base64.b64encode(media_bytes(image_url)).decode(), "media_category": "tweet_image", "media_type": mimetypes.guess_type(image_name)[0] or "image/png"}, {"Authorization": f"Bearer {token}"})
+        for url in image_urls:
+            image_name = Path(urlparse(url).path).name
+            result = request_json("https://api.x.com/2/media/upload", {"media": base64.b64encode(media_bytes(url)).decode(), "media_category": "tweet_image", "media_type": mimetypes.guess_type(image_name)[0] or "image/png"}, {"Authorization": f"Bearer {token}"})
             media_ids.append(str(result.get("data", {}).get("id") or result.get("data", {}).get("media_id") or ""))
-            if not media_ids[0]:
+            if not media_ids[-1]:
                 raise ProviderError("X did not return a media ID.")
         result = request_json("https://api.x.com/2/tweets", {"text": body, **({"media": {"media_ids": media_ids}} if media_ids else {})}, {"Authorization": f"Bearer {token}"})
         return str(result.get("data", {}).get("id") or "")
@@ -679,11 +715,22 @@ def publish(post: dict[str, Any], account: dict[str, Any] | None = None) -> str:
         page_id, token = account_id or credential("page_id", "FACEBOOK_PAGE_ID"), credential("access_token", "FACEBOOK_PAGE_ACCESS_TOKEN")
         if not page_id or not token:
             raise ProviderError("Facebook needs FACEBOOK_PAGE_ID and FACEBOOK_PAGE_ACCESS_TOKEN.")
-        endpoint = f"{config('META_GRAPH_BASE_URL') or 'https://graph.facebook.com/v24.0'}/{page_id}/{'photos' if image_url else 'feed'}"
-        fields = {"access_token": token, "caption" if image_url else "message": body}
-        if image_url:
-            fields["url"] = public_image_url(image_url)
-        result = request_form(endpoint, fields)
+        base = config('META_GRAPH_BASE_URL') or 'https://graph.facebook.com/v24.0'
+        if len(image_urls) > 1:
+            fields = {"access_token": token, "message": body}
+            for index, url in enumerate(image_urls):
+                photo = request_form(f"{base}/{page_id}/photos", {"access_token": token, "url": public_image_url(url), "published": "false"})
+                media_id = str(photo.get("id") or "")
+                if not media_id:
+                    raise ProviderError("Facebook did not upload a carousel image.")
+                fields[f"attached_media[{index}]"] = json.dumps({"media_fbid": media_id})
+            result = request_form(f"{base}/{page_id}/feed", fields)
+        else:
+            endpoint = f"{base}/{page_id}/{'photos' if image_url else 'feed'}"
+            fields = {"access_token": token, "caption" if image_url else "message": body}
+            if image_url:
+                fields["url"] = public_image_url(image_url)
+            result = request_form(endpoint, fields)
         return str(result.get("post_id") or result.get("id") or "")
     if channel == "Instagram":
         target_id, token = account_id or credential("account_id", "INSTAGRAM_ACCOUNT_ID"), credential("access_token", "INSTAGRAM_ACCESS_TOKEN")
@@ -692,20 +739,38 @@ def publish(post: dict[str, Any], account: dict[str, Any] | None = None) -> str:
         if not image_url:
             raise ProviderError("Instagram publishing requires an image in this first release.")
         base = config("META_GRAPH_BASE_URL") or "https://graph.facebook.com/v24.0"
-        container = request_form(f"{base}/{target_id}/media", {"access_token": token, "image_url": public_image_url(image_url), "caption": body})
+        if len(image_urls) > 1:
+            children: list[str] = []
+            for url in image_urls:
+                child = request_form(f"{base}/{target_id}/media", {"access_token": token, "image_url": public_image_url(url), "is_carousel_item": "true"})
+                if not child.get("id"):
+                    raise ProviderError("Instagram did not create a carousel item.")
+                children.append(str(child["id"]))
+            container = request_form(f"{base}/{target_id}/media", {"access_token": token, "media_type": "CAROUSEL", "children": ",".join(children), "caption": body})
+        else:
+            container = request_form(f"{base}/{target_id}/media", {"access_token": token, "image_url": public_image_url(image_url), "caption": body})
         creation_id = str(container.get("id") or "")
         if not creation_id:
             raise ProviderError("Instagram did not create a media container.")
-        result = request_form(f"{base}/{account_id}/media_publish", {"access_token": token, "creation_id": creation_id})
+        result = request_form(f"{base}/{target_id}/media_publish", {"access_token": token, "creation_id": creation_id})
         return str(result.get("id") or "")
     if channel == "Threads":
         user_id, token = account_id or credential("user_id", "THREADS_USER_ID"), credential("access_token", "THREADS_ACCESS_TOKEN")
         if not user_id or not token:
             raise ProviderError("Threads needs THREADS_USER_ID and THREADS_ACCESS_TOKEN.")
         base = config("THREADS_API_BASE_URL") or "https://graph.threads.net/v1.0"
-        fields = {"access_token": token, "media_type": "IMAGE" if image_url else "TEXT", "text": body}
-        if image_url:
-            fields["image_url"] = public_image_url(image_url)
+        if len(image_urls) > 1:
+            children: list[str] = []
+            for url in image_urls:
+                child = request_form(f"{base}/{user_id}/threads", {"access_token": token, "media_type": "IMAGE", "image_url": public_image_url(url), "is_carousel_item": "true"})
+                if not child.get("id"):
+                    raise ProviderError("Threads did not create a carousel item.")
+                children.append(str(child["id"]))
+            fields = {"access_token": token, "media_type": "CAROUSEL", "children": ",".join(children), "text": body}
+        else:
+            fields = {"access_token": token, "media_type": "IMAGE" if image_url else "TEXT", "text": body}
+            if image_url:
+                fields["image_url"] = public_image_url(image_url)
         container = request_form(f"{base}/{user_id}/threads", fields)
         creation_id = str(container.get("id") or "")
         if not creation_id:
@@ -988,6 +1053,8 @@ class Handler(SimpleHTTPRequestHandler):
             session = self._session()
             with db() as connection:
                 posts = [dict(row) for row in connection.execute("SELECT * FROM posts WHERE user_id = ? ORDER BY CASE state WHEN 'scheduled' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, scheduled_for, id DESC", (session["user_id"],)).fetchall()]
+                for post in posts:
+                    post["media_urls"] = [row["media_url"] for row in connection.execute("SELECT media_url FROM post_media WHERE post_id = ? ORDER BY position", (post["id"],)).fetchall()] or ([post["image_url"]] if post.get("image_url") else [])
             self._json({"posts": posts, "providers": [{"name": channel, "status": provider_status(channel)} for channel in CHANNELS]})
             return
         if path == "/api/admin/users":
@@ -1214,14 +1281,23 @@ class Handler(SimpleHTTPRequestHandler):
                 filename = f"{uuid.uuid4().hex}{IMAGE_TYPES[actual_type]}"
                 self._json({"url": store_media(filename, actual_type, image)}, HTTPStatus.CREATED); return
             if path == "/api/posts":
-                body, channel = str(payload.get("body", "")).strip(), str(payload.get("channel", "")).strip()
-                image_url = str(payload.get("image_url", "")).strip() or None
+                body, legacy_channel = str(payload.get("body", "")).strip(), str(payload.get("channel", "")).strip()
+                requested_channels = payload.get("channels", [legacy_channel])
+                if not isinstance(requested_channels, list) or not requested_channels:
+                    self._json({"error": "Select at least one platform."}, HTTPStatus.BAD_REQUEST); return
+                channels = list(dict.fromkeys(str(channel).strip() for channel in requested_channels))
+                image_urls = payload.get("image_urls")
+                if image_urls is None:
+                    image_urls = [str(payload.get("image_url", "")).strip()] if payload.get("image_url") else []
+                if not isinstance(image_urls, list) or any(not isinstance(url, str) or not url.strip() for url in image_urls):
+                    self._json({"error": "image_urls must be an array of uploaded image URLs."}, HTTPStatus.BAD_REQUEST); return
+                image_urls = list(dict.fromkeys(url.strip() for url in image_urls))
+                image_url = image_urls[0] if image_urls else None
                 target_ids = payload.get("connection_ids", [])
-                if not body or channel not in CHANNELS:
-                    self._json({"error": "A post and supported channel are required."}, HTTPStatus.BAD_REQUEST); return
-                if image_url and not media_exists(image_url):
+                if not body or any(channel not in CHANNELS for channel in channels):
+                    self._json({"error": "A post and at least one supported platform are required."}, HTTPStatus.BAD_REQUEST); return
+                if len(image_urls) > MAX_POST_MEDIA or any(not media_exists(url) for url in image_urls):
                     self._json({"error": "Unknown image upload."}, HTTPStatus.BAD_REQUEST); return
-                validate_post(channel, body, image_url)
                 if not isinstance(target_ids, list) or any(not isinstance(item, int) for item in target_ids):
                     self._json({"error": "connection_ids must be an array of numeric account IDs."}, HTTPStatus.BAD_REQUEST); return
                 schedule_zone = timezone_name(payload.get("scheduled_timezone") or session["timezone"])
@@ -1229,14 +1305,21 @@ class Handler(SimpleHTTPRequestHandler):
                 with db() as connection:
                     if target_ids:
                         placeholders = ",".join("?" for _ in target_ids)
-                        selected = connection.execute(f"SELECT id FROM connections WHERE user_id = ? AND provider = ? AND is_active = 1 AND (token_expires_at IS NULL OR token_expires_at > ?) AND id IN ({placeholders})", (session["user_id"], channel, now(), *target_ids)).fetchall()
-                        if len(selected) != len(set(target_ids)):
-                            self._json({"error": "Select only your connected accounts for the chosen provider."}, HTTPStatus.BAD_REQUEST); return
-                    post_id = insert_id(connection, "INSERT INTO posts (user_id, body, channel, state, scheduled_for, scheduled_timezone, image_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (session["user_id"], body, channel, "scheduled" if schedule else "draft", schedule, schedule_zone if schedule else None, image_url, now()))
+                        selected = connection.execute(f"SELECT id, provider FROM connections WHERE user_id = ? AND is_active = 1 AND (token_expires_at IS NULL OR token_expires_at > ?) AND id IN ({placeholders})", (session["user_id"], now(), *target_ids)).fetchall()
+                        if len(selected) != len(set(target_ids)) or {row["provider"] for row in selected} != set(channels):
+                            self._json({"error": "Select active accounts for every chosen platform."}, HTTPStatus.BAD_REQUEST); return
+                    elif len(channels) != 1:
+                        self._json({"error": "Connect an account for each platform when publishing to more than one platform."}, HTTPStatus.BAD_REQUEST); return
+                    for channel in channels:
+                        validate_post(channel, body, image_url, len(image_urls))
+                    post_id = insert_id(connection, "INSERT INTO posts (user_id, body, channel, state, scheduled_for, scheduled_timezone, image_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (session["user_id"], body, channels[0], "scheduled" if schedule else "draft", schedule, schedule_zone if schedule else None, image_url, now()))
                     for target_id in dict.fromkeys(target_ids):
                         connection.execute("INSERT INTO post_targets (post_id, connection_id) VALUES (?, ?)", (post_id, target_id))
+                    for position, url in enumerate(image_urls):
+                        connection.execute("INSERT INTO post_media (post_id, media_url, position) VALUES (?, ?, ?)", (post_id, url, position))
                     row = dict(connection.execute("SELECT * FROM posts WHERE id = ?", (post_id,)).fetchone())
-                audit(session["user_id"], "post.created", "post", post_id, f"Created {channel} post", self._source_ip())
+                row["media_urls"] = image_urls
+                audit(session["user_id"], "post.created", "post", post_id, f"Created {'/'.join(channels)} post", self._source_ip())
                 self._json(row, HTTPStatus.CREATED); return
             if path.startswith("/api/posts/") and path.endswith("/schedule"):
                 post_id, schedule_zone = int(path.split("/")[3]), timezone_name(payload.get("scheduled_timezone") or session["timezone"])
