@@ -74,7 +74,9 @@ Local disk (`SOSOPO_STORAGE_BACKEND=local`) is the default and stores uploads in
 
 ### AI post writing
 
-Sosopo can generate draft post copy inside the composer. An administrator configures providers in **Settings → AI providers**: choose the provider, enter an API key, its OpenAI-compatible HTTPS base URL when needed, and a default model. Credentials are encrypted at rest and never returned to the browser. OpenAI and OpenRouter use built-in bases; for Kimi, MiniMax, and Z.AI GLM, obtain the current compatible base URL from that provider's dashboard.
+Sosopo can generate draft post copy inside the composer. An administrator configures providers in the dedicated **AI providers** tab in the left rail: choose the provider, enter an API key, its OpenAI-compatible HTTPS base URL when needed, and a default model. Credentials are encrypted at rest and never returned to the browser. OpenAI and OpenRouter use built-in bases; for Kimi, MiniMax, and Z.AI GLM, obtain the current compatible base URL from that provider's dashboard.
+
+After saving a provider, use **Refresh and save model catalog**. Sosopo fetches the provider's model list once, saves it locally, and presents it as a dropdown in the composer. This avoids repeated provider calls during normal use and prevents a user from selecting an unreviewed model ID. The default discovery route is `BASE_URL/models`; if a compatible provider uses another route, enter its HTTPS **Model-list URL** in the AI provider form. Refresh the catalog whenever the provider changes its available models. This is deliberately provider-aware: OpenClaw likewise treats provider APIs and configured model catalogs separately rather than assuming every service behaves identically.
 
 Environment variables remain supported as an optional deployment/migration fallback, but users do not need to edit `.env` when the administrator configures providers in the UI.
 
@@ -90,7 +92,7 @@ SOSOPO_AI_KIMI_BASE_URL=https://provider.example/v1
 SOSOPO_AI_KIMI_MODEL=your-model-id
 ```
 
-The composer sends the user's brief, selected destinations, and optional draft to the selected provider, then puts returned copy into the editor for review; it never publishes automatically. API keys remain server-side and are not returned to browsers. OpenRouter documents its OpenAI-compatible `chat/completions` endpoint and model catalog in its [quickstart](https://openrouter.ai/docs/quickstart).
+The composer sends the user's brief, selected destinations, and optional draft to the selected provider, then puts returned copy into the editor for review; it never publishes automatically. API keys remain server-side and are not returned to browsers. OpenRouter documents its OpenAI-compatible `chat/completions` endpoint and model catalog in its [quickstart](https://openrouter.ai/docs/quickstart). For background on the provider-aware catalog design, see OpenClaw's [provider model documentation](https://docs.openclaw.ai/models) and [custom provider configuration](https://docs.openclaw.ai/gateway/config-tools).
 
 ### Account connections
 

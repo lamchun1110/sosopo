@@ -86,7 +86,7 @@ class SosopoTest(unittest.TestCase):
         try:
             settings = self.server.ai_provider_settings("OpenAI")
             self.assertEqual(settings["base_url"], "https://api.openai.com/v1")
-            self.assertEqual(self.server.available_ai_providers(), [{"name": "OpenAI", "model": "test-model"}])
+            self.assertEqual(self.server.available_ai_providers(), [{"name": "OpenAI", "model": "test-model", "models": []}])
         finally:
             os.environ.pop("SOSOPO_AI_OPENAI_API_KEY", None)
             os.environ.pop("SOSOPO_AI_OPENAI_MODEL", None)
@@ -97,7 +97,7 @@ class SosopoTest(unittest.TestCase):
             connection.execute("INSERT INTO instance_settings (name, value) VALUES (?, ?)", ("ai_provider_openai", s.encrypt_secrets({"api_key": "stored-key", "base_url": "https://ai.example/v1", "model": "stored-model"})))
         settings = s.ai_provider_settings("OpenAI")
         self.assertEqual({key: settings[key] for key in ("base_url", "model")}, {"base_url": "https://ai.example/v1", "model": "stored-model"})
-        self.assertEqual(s.available_ai_providers(), [{"name": "OpenAI", "model": "stored-model"}])
+        self.assertEqual(s.available_ai_providers(), [{"name": "OpenAI", "model": "stored-model", "models": []}])
 
     def test_ai_models_are_fetched_from_the_provider_models_endpoint(self) -> None:
         s = self.server
@@ -107,8 +107,16 @@ class SosopoTest(unittest.TestCase):
         s.request_get_json = lambda url, headers=None: {"data": [{"id": "model-b"}, {"id": "model-a"}, {"id": "model-a"}]}
         try:
             self.assertEqual(s.ai_provider_models("OpenAI"), ["model-a", "model-b"])
+            self.assertEqual(s.ai_model_catalog(s.stored_ai_provider_settings("OpenAI")), ["model-a", "model-b"])
         finally:
             s.request_get_json = original_request_get_json
+
+    def test_ai_generation_rejects_models_outside_the_saved_catalog(self) -> None:
+        s = self.server
+        with s.db() as connection:
+            connection.execute("INSERT INTO instance_settings (name, value) VALUES (?, ?)", ("ai_provider_openai", s.encrypt_secrets({"api_key": "stored-key", "base_url": "https://ai.example/v1", "model": "model-a", "models": '["model-a"]'})))
+        with self.assertRaisesRegex(s.ProviderError, "refreshed model catalog"):
+            s.generate_post_copy("OpenAI", "not-in-catalog", "", "", ["Facebook"])
 
     def test_multi_account_worker_marks_each_target_published(self) -> None:
         s = self.server

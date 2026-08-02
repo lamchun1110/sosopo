@@ -439,13 +439,35 @@ AI_PROVIDERS = {
 }
 
 
-def stored_ai_provider_settings(provider: str) -> dict[str, str]:
+def stored_ai_provider_settings(provider: str) -> dict:
     definition = AI_PROVIDERS.get(provider)
     if definition is None:
         raise ProviderError("Choose a supported AI provider.", retryable=False)
     with db() as connection:
         row = connection.execute("SELECT value FROM instance_settings WHERE name = ?", (f"ai_provider_{definition[0]}",)).fetchone()
     return decrypt_secrets(row["value"]) if row else {}
+
+
+def save_ai_provider_settings(provider: str, settings: dict) -> None:
+    """Save a provider configuration and its locally cached, reviewed model catalog."""
+    definition = AI_PROVIDERS[provider]
+    setting_name = f"ai_provider_{definition[0]}"
+    with db() as connection:
+        exists = connection.execute("SELECT 1 FROM instance_settings WHERE name = ?", (setting_name,)).fetchone()
+        if exists:
+            connection.execute("UPDATE instance_settings SET value = ? WHERE name = ?", (encrypt_secrets(settings), setting_name))
+        else:
+            connection.execute("INSERT INTO instance_settings (name, value) VALUES (?, ?)", (setting_name, encrypt_secrets(settings)))
+
+
+def ai_model_catalog(stored: dict) -> list[str]:
+    raw = stored.get("models", "[]")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+    return [model for model in raw if isinstance(model, str) and model] if isinstance(raw, list) else []
 
 
 def ai_provider_settings(provider: str) -> dict[str, str]:
@@ -463,21 +485,27 @@ def ai_provider_settings(provider: str) -> dict[str, str]:
     return {"name": provider, "api_key": api_key, "base_url": base_url.rstrip("/"), "model": model}
 
 
-def available_ai_providers() -> list[dict[str, str]]:
-    providers: list[dict[str, str]] = []
+def available_ai_providers() -> list[dict]:
+    providers: list[dict] = []
     for name in AI_PROVIDERS:
         try:
             settings = ai_provider_settings(name)
-            providers.append({"name": settings["name"], "model": settings["model"]})
+            stored = stored_ai_provider_settings(name)
+            models = ai_model_catalog(stored)
+            providers.append({"name": settings["name"], "model": settings["model"], "models": models})
         except ProviderError:
             pass
     return providers
 
 
 def ai_provider_models(provider: str) -> list[str]:
-    """Fetch model IDs from a configured provider's standard models endpoint."""
+    """Refresh the provider's model catalog using its configured discovery endpoint."""
     settings = ai_provider_settings(provider)
-    result = request_get_json(f"{settings['base_url']}/models", {"Authorization": f"Bearer {settings['api_key']}"})
+    stored = stored_ai_provider_settings(provider)
+    model_list_url = str(stored.get("model_list_url", "")).strip() or f"{settings['base_url']}/models"
+    if not model_list_url.startswith("https://") or len(model_list_url) > 500:
+        raise ProviderError("Use an HTTPS model-list URL.", retryable=False)
+    result = request_get_json(model_list_url, {"Authorization": f"Bearer {settings['api_key']}"})
     entries = result.get("data") or result.get("models") or []
     if not isinstance(entries, list):
         raise ProviderError("The AI provider returned an invalid model list.")
@@ -488,12 +516,21 @@ def ai_provider_models(provider: str) -> list[str]:
             models.append(identifier)
     if not models:
         raise ProviderError("The AI provider did not return any selectable models.")
-    return sorted(set(models), key=str.casefold)[:1_000]
+    models = sorted(set(models), key=str.casefold)[:1_000]
+    # Keep a known-good catalog locally. The composer uses this catalog rather than
+    # contacting the provider on every page load, and rejects unknown model IDs.
+    stored.update({"models": json.dumps(models), "models_checked_at": now()})
+    save_ai_provider_settings(provider, stored)
+    return models
 
 
 def generate_post_copy(provider: str, model: str, instruction: str, draft: str, channels: list[str]) -> str:
     settings = ai_provider_settings(provider)
     selected_model = model.strip() or settings["model"]
+    stored = stored_ai_provider_settings(provider)
+    catalog = ai_model_catalog(stored)
+    if catalog and selected_model not in catalog:
+        raise ProviderError("Choose a model from the provider's refreshed model catalog.", retryable=False)
     if len(selected_model) > 200 or len(instruction) > 2_000 or len(draft) > 5_000:
         raise ProviderError("AI request is too long.", retryable=False)
     prompt = f"Write one ready-to-publish social media post. Platforms: {', '.join(channels) or 'general social media'}. Brief: {instruction.strip() or 'Improve the draft below.'}\nDraft to improve (may be empty):\n{draft.strip()}"
@@ -1349,7 +1386,8 @@ class Handler(SimpleHTTPRequestHandler):
             for name, (slug, _, default_base) in AI_PROVIDERS.items():
                 stored = stored_ai_provider_settings(name)
                 if stored:
-                    providers.append({"name": name, "base_url": stored.get("base_url") or default_base, "model": stored.get("model", ""), "has_api_key": bool(stored.get("api_key"))})
+                    catalog = ai_model_catalog(stored)
+                    providers.append({"name": name, "base_url": stored.get("base_url") or default_base, "model": stored.get("model", ""), "model_list_url": stored.get("model_list_url", ""), "models_count": len(catalog), "models_checked_at": stored.get("models_checked_at"), "has_api_key": bool(stored.get("api_key"))})
             self._json({"providers": providers}); return
         if path.startswith("/api/admin/ai-providers/") and path.endswith("/models"):
             session = self._session()
@@ -1479,19 +1517,18 @@ class Handler(SimpleHTTPRequestHandler):
                 base_url = str(payload.get("base_url", "")).strip() or definition[2]
                 model = str(payload.get("model", "")).strip()
                 api_key = str(payload.get("api_key", "")).strip()
-                if not base_url.startswith("https://") or len(base_url) > 500 or not model or len(model) > 200:
+                model_list_url = str(payload.get("model_list_url", "")).strip()
+                if not base_url.startswith("https://") or len(base_url) > 500 or not model or len(model) > 200 or (model_list_url and (not model_list_url.startswith("https://") or len(model_list_url) > 500)):
                     self._json({"error": "Use an HTTPS base URL and a model ID of 200 characters or fewer."}, HTTPStatus.BAD_REQUEST); return
                 current = stored_ai_provider_settings(provider)
                 if not api_key and not current.get("api_key"):
                     self._json({"error": "Provide an API key for this provider."}, HTTPStatus.BAD_REQUEST); return
-                stored = {"api_key": api_key or current["api_key"], "base_url": base_url, "model": model}
-                setting_name = f"ai_provider_{definition[0]}"
-                with db() as connection:
-                    exists = connection.execute("SELECT 1 FROM instance_settings WHERE name = ?", (setting_name,)).fetchone()
-                    if exists:
-                        connection.execute("UPDATE instance_settings SET value = ? WHERE name = ?", (encrypt_secrets(stored), setting_name))
-                    else:
-                        connection.execute("INSERT INTO instance_settings (name, value) VALUES (?, ?)", (setting_name, encrypt_secrets(stored)))
+                # Keep the selected model even when the catalog is refreshed later;
+                # changing endpoints invalidates the old catalog.
+                stored = {"api_key": api_key or current["api_key"], "base_url": base_url, "model": model, "model_list_url": model_list_url}
+                if current.get("base_url") == base_url and current.get("model_list_url", "") == model_list_url:
+                    stored.update({key: current[key] for key in ("models", "models_checked_at") if key in current})
+                save_ai_provider_settings(provider, stored)
                 audit(session["user_id"], "ai_provider.saved", "instance", provider, f"Configured {provider} AI provider", self._source_ip())
                 self._json({"name": provider, "base_url": base_url, "model": model, "has_api_key": True}); return
             if path == "/api/ai/generate":
