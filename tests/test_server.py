@@ -80,6 +80,17 @@ class SosopoTest(unittest.TestCase):
             os.environ.pop("FACEBOOK_OAUTH_CLIENT_ID", None)
             os.environ.pop("FACEBOOK_OAUTH_CLIENT_SECRET", None)
 
+    def test_openai_compatible_ai_provider_configuration_is_secret_safe(self) -> None:
+        os.environ["SOSOPO_AI_OPENAI_API_KEY"] = "test-key"
+        os.environ["SOSOPO_AI_OPENAI_MODEL"] = "test-model"
+        try:
+            settings = self.server.ai_provider_settings("OpenAI")
+            self.assertEqual(settings["base_url"], "https://api.openai.com/v1")
+            self.assertEqual(self.server.available_ai_providers(), [{"name": "OpenAI", "model": "test-model"}])
+        finally:
+            os.environ.pop("SOSOPO_AI_OPENAI_API_KEY", None)
+            os.environ.pop("SOSOPO_AI_OPENAI_MODEL", None)
+
     def test_multi_account_worker_marks_each_target_published(self) -> None:
         s = self.server
         with s.db() as connection:

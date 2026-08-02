@@ -72,6 +72,24 @@ Every sensitive setting also accepts a `_FILE` variant. This is recommended for 
 
 Local disk (`SOSOPO_STORAGE_BACKEND=local`) is the default and stores uploads in `./data/uploads`. To use Amazon S3, MinIO, or another S3-compatible store, set `SOSOPO_STORAGE_BACKEND=s3`, `S3_MEDIA_BUCKET`, optional `S3_MEDIA_PREFIX`/`S3_ENDPOINT_URL`, AWS credentials, and `SOSOPO_MEDIA_PUBLIC_URL`. The public URL must be HTTPS and map to the bucket/prefix (for example `https://media.example.com/uploads`); providers must be able to fetch each image after it is scheduled. Keep bucket write credentials private and grant public read only through a scoped CDN/bucket policy for the media prefix.
 
+### AI post writing
+
+Sosopo can generate draft post copy inside the composer. Configure one or more OpenAI-compatible providers in `.env`; only providers with an API key, HTTPS base URL, and default model appear to users. OpenAI and OpenRouter use built-in bases; for Kimi, MiniMax, and Z.AI GLM, set the current compatible base URL from that provider's dashboard.
+
+```env
+SOSOPO_AI_OPENAI_API_KEY=...
+SOSOPO_AI_OPENAI_MODEL=gpt-4.1-mini
+
+SOSOPO_AI_OPENROUTER_API_KEY=...
+SOSOPO_AI_OPENROUTER_MODEL=openai/gpt-4.1-mini
+
+SOSOPO_AI_KIMI_API_KEY=...
+SOSOPO_AI_KIMI_BASE_URL=https://provider.example/v1
+SOSOPO_AI_KIMI_MODEL=your-model-id
+```
+
+The composer sends the user's brief, selected destinations, and optional draft to the selected provider, then puts returned copy into the editor for review; it never publishes automatically. API keys remain server-side and are not returned to browsers. OpenRouter documents its OpenAI-compatible `chat/completions` endpoint and model catalog in its [quickstart](https://openrouter.ai/docs/quickstart).
+
 ### Account connections
 
 One owner can hold multiple Facebook Pages, Instagram accounts, Threads profiles, X accounts, Telegram channels, Discord webhooks, or LinkedIn authors. Connection secrets are encrypted with Fernet before being written to the database and are never returned by the API. The composer can select several platforms and one or more connected accounts per platform in a single post. Delivery is independently recorded for each account, so a failure on one destination can be retried without reposting to accounts that already succeeded. A single-platform post may still use legacy environment credentials when no connected account is selected.

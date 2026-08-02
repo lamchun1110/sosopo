@@ -430,6 +430,50 @@ def config(name: str) -> str:
     return environment_value(name)
 
 
+def ai_provider_settings(provider: str) -> dict[str, str]:
+    """Return only a configured, OpenAI-compatible text-generation provider."""
+    providers = {
+        "OpenAI": ("SOSOPO_AI_OPENAI", "https://api.openai.com/v1"),
+        "OpenRouter": ("SOSOPO_AI_OPENROUTER", "https://openrouter.ai/api/v1"),
+        "Kimi": ("SOSOPO_AI_KIMI", ""),
+        "MiniMax": ("SOSOPO_AI_MINIMAX", ""),
+        "Z.AI GLM": ("SOSOPO_AI_ZAI", ""),
+    }
+    definition = providers.get(provider)
+    if definition is None:
+        raise ProviderError("Choose a supported AI provider.", retryable=False)
+    prefix, default_base = definition
+    api_key, base_url, model = config(f"{prefix}_API_KEY"), config(f"{prefix}_BASE_URL") or default_base, config(f"{prefix}_MODEL")
+    if not api_key or not base_url.startswith("https://") or not model:
+        raise ProviderError(f"{provider} AI is not configured by this Sosopo administrator.", retryable=False)
+    return {"name": provider, "api_key": api_key, "base_url": base_url.rstrip("/"), "model": model}
+
+
+def available_ai_providers() -> list[dict[str, str]]:
+    providers: list[dict[str, str]] = []
+    for name in ("OpenAI", "OpenRouter", "Kimi", "MiniMax", "Z.AI GLM"):
+        try:
+            settings = ai_provider_settings(name)
+            providers.append({"name": settings["name"], "model": settings["model"]})
+        except ProviderError:
+            pass
+    return providers
+
+
+def generate_post_copy(provider: str, model: str, instruction: str, draft: str, channels: list[str]) -> str:
+    settings = ai_provider_settings(provider)
+    selected_model = model.strip() or settings["model"]
+    if len(selected_model) > 200 or len(instruction) > 2_000 or len(draft) > 5_000:
+        raise ProviderError("AI request is too long.", retryable=False)
+    prompt = f"Write one ready-to-publish social media post. Platforms: {', '.join(channels) or 'general social media'}. Brief: {instruction.strip() or 'Improve the draft below.'}\nDraft to improve (may be empty):\n{draft.strip()}"
+    result = request_json(f"{settings['base_url']}/chat/completions", {"model": selected_model, "messages": [{"role": "system", "content": "You are Sosopo's concise social-media copywriter. Return only the finished post copy; do not add a title, explanation, markdown fence, or quotation marks."}, {"role": "user", "content": prompt}], "temperature": 0.7, "max_tokens": 700}, {"Authorization": f"Bearer {settings['api_key']}"})
+    choices = result.get("choices", [])
+    content = choices[0].get("message", {}).get("content", "") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else ""
+    if not isinstance(content, str) or not content.strip():
+        raise ProviderError("The AI provider did not return post copy.")
+    return content.strip()
+
+
 def audit(user_id: int | None, action: str, subject_type: str, subject_id: object | None, detail: str, source_ip: str) -> None:
     with db() as connection:
         connection.execute(
@@ -1255,6 +1299,10 @@ class Handler(SimpleHTTPRequestHandler):
                     post["media_urls"] = [row["media_url"] for row in connection.execute("SELECT media_url FROM post_media WHERE post_id = ? ORDER BY position", (post["id"],)).fetchall()] or ([post["image_url"]] if post.get("image_url") else [])
             self._json({"posts": posts, "providers": [{"name": channel, "status": provider_status(channel), "oauth_available": social_oauth_enabled(channel)} for channel in CHANNELS]})
             return
+        if path == "/api/ai/providers":
+            self._session()
+            self._json({"providers": available_ai_providers()})
+            return
         if path == "/api/admin/users":
             session = self._session()
             if session["role"] != "admin":
@@ -1370,6 +1418,20 @@ class Handler(SimpleHTTPRequestHandler):
             session = self._require_auth(csrf=True)
             if session is None:
                 return
+            if path == "/api/ai/generate":
+                provider = str(payload.get("provider", ""))
+                model = str(payload.get("model", ""))
+                instruction = str(payload.get("instruction", ""))
+                draft = str(payload.get("draft", ""))
+                channels = payload.get("channels", [])
+                if not isinstance(channels, list) or any(str(channel) not in CHANNELS for channel in channels):
+                    self._json({"error": "Choose valid post platforms for AI generation."}, HTTPStatus.BAD_REQUEST); return
+                try:
+                    copy = generate_post_copy(provider, model, instruction, draft, [str(channel) for channel in channels])
+                except ProviderError as error:
+                    self._json({"error": str(error)}, HTTPStatus.BAD_GATEWAY); return
+                audit(session["user_id"], "post.ai_generated", "user", session["user_id"], f"Generated post copy with {provider}", self._source_ip())
+                self._json({"copy": copy}); return
             if path == "/api/me/timezone":
                 zone = timezone_name(payload.get("timezone"))
                 with db() as connection:
