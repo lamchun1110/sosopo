@@ -294,6 +294,7 @@ def setup_database() -> None:
                 role TEXT NOT NULL DEFAULT 'user',
                 is_active INTEGER NOT NULL DEFAULT 1,
                 timezone TEXT NOT NULL DEFAULT 'UTC',
+                signature TEXT NOT NULL DEFAULT '',
                 oidc_issuer TEXT,
                 oidc_subject TEXT,
                 created_at TEXT NOT NULL
@@ -373,7 +374,7 @@ def setup_database() -> None:
             ("scheduled_timezone", "TEXT"), ("publishing_started_at", "TEXT"),
         ):
             add_column(connection, name, definition)
-        for name, definition in (("role", "TEXT NOT NULL DEFAULT 'user'"), ("is_active", "INTEGER NOT NULL DEFAULT 1"), ("timezone", "TEXT NOT NULL DEFAULT 'UTC'"), ("oidc_issuer", "TEXT"), ("oidc_subject", "TEXT")):
+        for name, definition in (("role", "TEXT NOT NULL DEFAULT 'user'"), ("is_active", "INTEGER NOT NULL DEFAULT 1"), ("timezone", "TEXT NOT NULL DEFAULT 'UTC'"), ("signature", "TEXT NOT NULL DEFAULT ''"), ("oidc_issuer", "TEXT"), ("oidc_subject", "TEXT")):
             add_table_column(connection, "users", name, definition)
         add_table_column(connection, "connections", "is_active", "INTEGER NOT NULL DEFAULT 1")
         connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_oidc_identity ON users(oidc_issuer, oidc_subject)")
@@ -1047,7 +1048,7 @@ class Handler(SimpleHTTPRequestHandler):
         token_hash = hashlib.sha256(token.value.encode()).hexdigest()
         with db() as connection:
             return connection.execute(
-                "SELECT sessions.*, users.username, users.role, users.timezone FROM sessions JOIN users ON users.id = sessions.user_id WHERE token_hash = ? AND expires_at > ? AND users.is_active = 1",
+                "SELECT sessions.*, users.username, users.role, users.timezone, users.signature FROM sessions JOIN users ON users.id = sessions.user_id WHERE token_hash = ? AND expires_at > ? AND users.is_active = 1",
                 (token_hash, now()),
             ).fetchone()
 
@@ -1153,7 +1154,7 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/session":
             session = self._require_auth()
             if session:
-                self._json({"username": session["username"], "role": session["role"], "timezone": session["timezone"], "csrf_token": session["csrf_token"]})
+                self._json({"username": session["username"], "role": session["role"], "timezone": session["timezone"], "signature": session["signature"], "csrf_token": session["csrf_token"]})
             return
         if path == "/api/auth/oidc/login":
             try:
@@ -1374,6 +1375,15 @@ class Handler(SimpleHTTPRequestHandler):
                 with db() as connection:
                     connection.execute("UPDATE users SET timezone = ? WHERE id = ?", (zone, session["user_id"]))
                 self._json({"timezone": zone}); return
+            if path == "/api/me/settings":
+                zone = timezone_name(payload.get("timezone") or session["timezone"])
+                signature = str(payload.get("signature", "")).strip()
+                if len(signature) > 1_000:
+                    self._json({"error": "Signature must be 1,000 characters or fewer."}, HTTPStatus.BAD_REQUEST); return
+                with db() as connection:
+                    connection.execute("UPDATE users SET timezone = ?, signature = ? WHERE id = ?", (zone, signature, session["user_id"]))
+                audit(session["user_id"], "user.settings_changed", "user", session["user_id"], "Updated timezone or signature", self._source_ip())
+                self._json({"timezone": zone, "signature": signature}); return
             if path == "/api/me/password":
                 current_password = str(payload.get("current_password", ""))
                 new_password = str(payload.get("new_password", ""))
@@ -1504,6 +1514,8 @@ class Handler(SimpleHTTPRequestHandler):
                     self._json({"error": "Unknown image upload."}, HTTPStatus.BAD_REQUEST); return
                 if not isinstance(target_ids, list) or any(not isinstance(item, int) for item in target_ids):
                     self._json({"error": "connection_ids must be an array of numeric account IDs."}, HTTPStatus.BAD_REQUEST); return
+                if payload.get("apply_signature", True) and session["signature"]:
+                    body = f"{body.rstrip()}\n\n{str(session['signature']).strip()}"
                 schedule_zone = timezone_name(payload.get("scheduled_timezone") or session["timezone"])
                 schedule = self._schedule_time(payload["scheduled_for"], schedule_zone) if payload.get("scheduled_for") else None
                 with db() as connection:
