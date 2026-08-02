@@ -99,6 +99,17 @@ class SosopoTest(unittest.TestCase):
         self.assertEqual({key: settings[key] for key in ("base_url", "model")}, {"base_url": "https://ai.example/v1", "model": "stored-model"})
         self.assertEqual(s.available_ai_providers(), [{"name": "OpenAI", "model": "stored-model"}])
 
+    def test_ai_models_are_fetched_from_the_provider_models_endpoint(self) -> None:
+        s = self.server
+        with s.db() as connection:
+            connection.execute("INSERT INTO instance_settings (name, value) VALUES (?, ?)", ("ai_provider_openai", s.encrypt_secrets({"api_key": "stored-key", "base_url": "https://ai.example/v1", "model": "stored-model"})))
+        original_request_get_json = s.request_get_json
+        s.request_get_json = lambda url, headers=None: {"data": [{"id": "model-b"}, {"id": "model-a"}, {"id": "model-a"}]}
+        try:
+            self.assertEqual(s.ai_provider_models("OpenAI"), ["model-a", "model-b"])
+        finally:
+            s.request_get_json = original_request_get_json
+
     def test_multi_account_worker_marks_each_target_published(self) -> None:
         s = self.server
         with s.db() as connection:

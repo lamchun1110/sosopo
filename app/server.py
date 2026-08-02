@@ -474,6 +474,23 @@ def available_ai_providers() -> list[dict[str, str]]:
     return providers
 
 
+def ai_provider_models(provider: str) -> list[str]:
+    """Fetch model IDs from a configured provider's standard models endpoint."""
+    settings = ai_provider_settings(provider)
+    result = request_get_json(f"{settings['base_url']}/models", {"Authorization": f"Bearer {settings['api_key']}"})
+    entries = result.get("data") or result.get("models") or []
+    if not isinstance(entries, list):
+        raise ProviderError("The AI provider returned an invalid model list.")
+    models = []
+    for entry in entries:
+        identifier = entry.get("id") if isinstance(entry, dict) else entry if isinstance(entry, str) else None
+        if isinstance(identifier, str) and identifier and len(identifier) <= 200:
+            models.append(identifier)
+    if not models:
+        raise ProviderError("The AI provider did not return any selectable models.")
+    return sorted(set(models), key=str.casefold)[:1_000]
+
+
 def generate_post_copy(provider: str, model: str, instruction: str, draft: str, channels: list[str]) -> str:
     settings = ai_provider_settings(provider)
     selected_model = model.strip() or settings["model"]
@@ -1334,6 +1351,16 @@ class Handler(SimpleHTTPRequestHandler):
                 if stored:
                     providers.append({"name": name, "base_url": stored.get("base_url") or default_base, "model": stored.get("model", ""), "has_api_key": bool(stored.get("api_key"))})
             self._json({"providers": providers}); return
+        if path.startswith("/api/admin/ai-providers/") and path.endswith("/models"):
+            session = self._session()
+            if session["role"] != "admin":
+                self._json({"error": "Administrator access required."}, HTTPStatus.FORBIDDEN); return
+            provider = unquote(path.split("/")[4])
+            try:
+                self._json({"models": ai_provider_models(provider)})
+            except ProviderError as error:
+                self._json({"error": str(error)}, HTTPStatus.BAD_GATEWAY)
+            return
         if path == "/api/admin/audit-events":
             session = self._session()
             if session["role"] != "admin":
