@@ -70,6 +70,16 @@ class SosopoTest(unittest.TestCase):
         self.assertEqual(records[0]["secret_name"], "webhook_url")
         self.assertEqual(records[0]["access_token"], "https://discord.com/api/webhooks/123/webhook-secret")
 
+    def test_instagram_uses_the_facebook_oauth_configuration(self) -> None:
+        os.environ["FACEBOOK_OAUTH_CLIENT_ID"] = "meta-client"
+        os.environ["FACEBOOK_OAUTH_CLIENT_SECRET"] = "meta-secret"
+        try:
+            self.assertEqual(self.server.social_oauth_settings("Instagram")["client_id"], "meta-client")
+            self.assertTrue(self.server.social_oauth_enabled("Instagram"))
+        finally:
+            os.environ.pop("FACEBOOK_OAUTH_CLIENT_ID", None)
+            os.environ.pop("FACEBOOK_OAUTH_CLIENT_SECRET", None)
+
     def test_multi_account_worker_marks_each_target_published(self) -> None:
         s = self.server
         with s.db() as connection:

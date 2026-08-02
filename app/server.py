@@ -546,6 +546,10 @@ def social_oauth_redirect_uri() -> str:
 
 
 def social_oauth_settings(provider: str) -> dict[str, str]:
+    # Instagram professional accounts are authorized and discovered through the
+    # same Meta Page grant as Facebook; the dashboard exposes both entry points.
+    if provider == "Instagram":
+        provider = "Facebook"
     settings = {
         "Facebook": {"client_id": config("FACEBOOK_OAUTH_CLIENT_ID"), "client_secret": config("FACEBOOK_OAUTH_CLIENT_SECRET"), "authorize": config("FACEBOOK_OAUTH_AUTHORIZE_URL") or "https://www.facebook.com/v24.0/dialog/oauth", "token": config("FACEBOOK_OAUTH_TOKEN_URL") or "https://graph.facebook.com/v24.0/oauth/access_token", "scopes": "pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish"},
         "Threads": {"client_id": config("THREADS_OAUTH_CLIENT_ID"), "client_secret": config("THREADS_OAUTH_CLIENT_SECRET"), "authorize": config("THREADS_OAUTH_AUTHORIZE_URL") or "https://threads.net/oauth/authorize", "token": config("THREADS_OAUTH_TOKEN_URL") or "https://graph.threads.net/oauth/access_token", "scopes": "threads_basic,threads_content_publish"},
@@ -1224,6 +1228,8 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path.startswith("/api/social-oauth/") and path.endswith("/start"):
             provider = path.split("/")[3]
+            if provider == "Instagram":
+                provider = "Facebook"
             if provider not in {"Facebook", "Threads", "X", "LinkedIn", "Discord"}:
                 self._json({"error": "Unsupported social OAuth provider."}, HTTPStatus.NOT_FOUND); return
             try:
