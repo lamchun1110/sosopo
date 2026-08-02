@@ -91,6 +91,14 @@ class SosopoTest(unittest.TestCase):
             os.environ.pop("SOSOPO_AI_OPENAI_API_KEY", None)
             os.environ.pop("SOSOPO_AI_OPENAI_MODEL", None)
 
+    def test_database_ai_provider_settings_override_environment(self) -> None:
+        s = self.server
+        with s.db() as connection:
+            connection.execute("INSERT INTO instance_settings (name, value) VALUES (?, ?)", ("ai_provider_openai", s.encrypt_secrets({"api_key": "stored-key", "base_url": "https://ai.example/v1", "model": "stored-model"})))
+        settings = s.ai_provider_settings("OpenAI")
+        self.assertEqual({key: settings[key] for key in ("base_url", "model")}, {"base_url": "https://ai.example/v1", "model": "stored-model"})
+        self.assertEqual(s.available_ai_providers(), [{"name": "OpenAI", "model": "stored-model"}])
+
     def test_multi_account_worker_marks_each_target_published(self) -> None:
         s = self.server
         with s.db() as connection:

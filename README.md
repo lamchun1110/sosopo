@@ -74,7 +74,9 @@ Local disk (`SOSOPO_STORAGE_BACKEND=local`) is the default and stores uploads in
 
 ### AI post writing
 
-Sosopo can generate draft post copy inside the composer. Configure one or more OpenAI-compatible providers in `.env`; only providers with an API key, HTTPS base URL, and default model appear to users. OpenAI and OpenRouter use built-in bases; for Kimi, MiniMax, and Z.AI GLM, set the current compatible base URL from that provider's dashboard.
+Sosopo can generate draft post copy inside the composer. An administrator configures providers in **Settings → AI providers**: choose the provider, enter an API key, its OpenAI-compatible HTTPS base URL when needed, and a default model. Credentials are encrypted at rest and never returned to the browser. OpenAI and OpenRouter use built-in bases; for Kimi, MiniMax, and Z.AI GLM, obtain the current compatible base URL from that provider's dashboard.
+
+Environment variables remain supported as an optional deployment/migration fallback, but users do not need to edit `.env` when the administrator configures providers in the UI.
 
 ```env
 SOSOPO_AI_OPENAI_API_KEY=...

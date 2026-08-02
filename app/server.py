@@ -430,20 +430,34 @@ def config(name: str) -> str:
     return environment_value(name)
 
 
-def ai_provider_settings(provider: str) -> dict[str, str]:
-    """Return only a configured, OpenAI-compatible text-generation provider."""
-    providers = {
-        "OpenAI": ("SOSOPO_AI_OPENAI", "https://api.openai.com/v1"),
-        "OpenRouter": ("SOSOPO_AI_OPENROUTER", "https://openrouter.ai/api/v1"),
-        "Kimi": ("SOSOPO_AI_KIMI", ""),
-        "MiniMax": ("SOSOPO_AI_MINIMAX", ""),
-        "Z.AI GLM": ("SOSOPO_AI_ZAI", ""),
-    }
-    definition = providers.get(provider)
+AI_PROVIDERS = {
+    "OpenAI": ("openai", "SOSOPO_AI_OPENAI", "https://api.openai.com/v1"),
+    "OpenRouter": ("openrouter", "SOSOPO_AI_OPENROUTER", "https://openrouter.ai/api/v1"),
+    "Kimi": ("kimi", "SOSOPO_AI_KIMI", ""),
+    "MiniMax": ("minimax", "SOSOPO_AI_MINIMAX", ""),
+    "Z.AI GLM": ("zai", "SOSOPO_AI_ZAI", ""),
+}
+
+
+def stored_ai_provider_settings(provider: str) -> dict[str, str]:
+    definition = AI_PROVIDERS.get(provider)
     if definition is None:
         raise ProviderError("Choose a supported AI provider.", retryable=False)
-    prefix, default_base = definition
-    api_key, base_url, model = config(f"{prefix}_API_KEY"), config(f"{prefix}_BASE_URL") or default_base, config(f"{prefix}_MODEL")
+    with db() as connection:
+        row = connection.execute("SELECT value FROM instance_settings WHERE name = ?", (f"ai_provider_{definition[0]}",)).fetchone()
+    return decrypt_secrets(row["value"]) if row else {}
+
+
+def ai_provider_settings(provider: str) -> dict[str, str]:
+    """Return only a configured, OpenAI-compatible text-generation provider."""
+    definition = AI_PROVIDERS.get(provider)
+    if definition is None:
+        raise ProviderError("Choose a supported AI provider.", retryable=False)
+    _, prefix, default_base = definition
+    stored = stored_ai_provider_settings(provider)
+    api_key = stored.get("api_key") or config(f"{prefix}_API_KEY")
+    base_url = stored.get("base_url") or config(f"{prefix}_BASE_URL") or default_base
+    model = stored.get("model") or config(f"{prefix}_MODEL")
     if not api_key or not base_url.startswith("https://") or not model:
         raise ProviderError(f"{provider} AI is not configured by this Sosopo administrator.", retryable=False)
     return {"name": provider, "api_key": api_key, "base_url": base_url.rstrip("/"), "model": model}
@@ -451,7 +465,7 @@ def ai_provider_settings(provider: str) -> dict[str, str]:
 
 def available_ai_providers() -> list[dict[str, str]]:
     providers: list[dict[str, str]] = []
-    for name in ("OpenAI", "OpenRouter", "Kimi", "MiniMax", "Z.AI GLM"):
+    for name in AI_PROVIDERS:
         try:
             settings = ai_provider_settings(name)
             providers.append({"name": settings["name"], "model": settings["model"]})
@@ -1310,6 +1324,16 @@ class Handler(SimpleHTTPRequestHandler):
             with db() as connection:
                 users = [dict(row) for row in connection.execute("SELECT id, username, role, is_active, timezone, oidc_issuer, created_at FROM users ORDER BY id").fetchall()]
             self._json({"users": users}); return
+        if path == "/api/admin/ai-providers":
+            session = self._session()
+            if session["role"] != "admin":
+                self._json({"error": "Administrator access required."}, HTTPStatus.FORBIDDEN); return
+            providers = []
+            for name, (slug, _, default_base) in AI_PROVIDERS.items():
+                stored = stored_ai_provider_settings(name)
+                if stored:
+                    providers.append({"name": name, "base_url": stored.get("base_url") or default_base, "model": stored.get("model", ""), "has_api_key": bool(stored.get("api_key"))})
+            self._json({"providers": providers}); return
         if path == "/api/admin/audit-events":
             session = self._session()
             if session["role"] != "admin":
@@ -1418,6 +1442,31 @@ class Handler(SimpleHTTPRequestHandler):
             session = self._require_auth(csrf=True)
             if session is None:
                 return
+            if path == "/api/admin/ai-providers":
+                if session["role"] != "admin":
+                    self._json({"error": "Administrator access required."}, HTTPStatus.FORBIDDEN); return
+                provider = str(payload.get("provider", "")).strip()
+                definition = AI_PROVIDERS.get(provider)
+                if definition is None:
+                    self._json({"error": "Choose a supported AI provider."}, HTTPStatus.BAD_REQUEST); return
+                base_url = str(payload.get("base_url", "")).strip() or definition[2]
+                model = str(payload.get("model", "")).strip()
+                api_key = str(payload.get("api_key", "")).strip()
+                if not base_url.startswith("https://") or len(base_url) > 500 or not model or len(model) > 200:
+                    self._json({"error": "Use an HTTPS base URL and a model ID of 200 characters or fewer."}, HTTPStatus.BAD_REQUEST); return
+                current = stored_ai_provider_settings(provider)
+                if not api_key and not current.get("api_key"):
+                    self._json({"error": "Provide an API key for this provider."}, HTTPStatus.BAD_REQUEST); return
+                stored = {"api_key": api_key or current["api_key"], "base_url": base_url, "model": model}
+                setting_name = f"ai_provider_{definition[0]}"
+                with db() as connection:
+                    exists = connection.execute("SELECT 1 FROM instance_settings WHERE name = ?", (setting_name,)).fetchone()
+                    if exists:
+                        connection.execute("UPDATE instance_settings SET value = ? WHERE name = ?", (encrypt_secrets(stored), setting_name))
+                    else:
+                        connection.execute("INSERT INTO instance_settings (name, value) VALUES (?, ?)", (setting_name, encrypt_secrets(stored)))
+                audit(session["user_id"], "ai_provider.saved", "instance", provider, f"Configured {provider} AI provider", self._source_ip())
+                self._json({"name": provider, "base_url": base_url, "model": model, "has_api_key": True}); return
             if path == "/api/ai/generate":
                 provider = str(payload.get("provider", ""))
                 model = str(payload.get("model", ""))
