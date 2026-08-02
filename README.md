@@ -80,7 +80,19 @@ Posts can include up to 10 images, with provider-specific limits checked before 
 
 The publish timezone is an IANA timezone dropdown populated by the browser (for example `Asia/Hong_Kong`). Sosopo converts the chosen local date/time to UTC and stores the selected timezone with the post.
 
-The dashboard's **Connected accounts** form creates and disables account records. The underlying `POST /api/connections` API requires a signed-in session plus its CSRF token and accepts a provider, display name, external account ID, optional settings, and provider secrets. Use `access_token` for Facebook, Instagram, Threads, and X; use `bot_token` for Telegram. `external_account_id` is the Page/account/profile ID (or Telegram chat/channel ID). OAuth account discovery remains future work; manual encrypted token entry is available today.
+The dashboard's **Connected accounts** form creates and disables account records. The underlying `POST /api/connections` API requires a signed-in session plus its CSRF token and accepts a provider, display name, external account ID, optional settings, and provider secrets. Use `access_token` for Facebook, Instagram, Threads, and X; use `bot_token` for Telegram. `external_account_id` is the Page/account/profile ID (or Telegram chat/channel ID). Manual encrypted token entry remains available for providers or environments where OAuth is not configured.
+
+### OAuth account connection
+
+For a no-copy connection experience, configure an OAuth application once per Sosopo instance. Signed-in users can then use **Connect** beside Facebook, Threads, or X; Sosopo redirects to the provider, verifies a short-lived one-time state, discovers the available account(s), and stores the returned credentials encrypted. Facebook connection also discovers linked Instagram professional accounts.
+
+Set the matching client ID and client secret from `.env.example`, then register this exact HTTPS redirect URL in each provider app:
+
+```text
+https://your-sosopo-domain.example/api/social-oauth/callback
+```
+
+For Meta, request the Page and Instagram publishing permissions listed in `.env.example` and ensure the signing-in person manages the Page. Meta production use can require app review and business verification. For X, configure OAuth 2.0 Authorization Code with PKCE and user-context posting access. Telegram continues to use a BotFather token and channel/chat ID because its Bot API has no equivalent account-approval flow.
 
 API clients may include `token_expires_at` as a future ISO 8601 timestamp with a timezone. Expired accounts cannot be selected for a new post and the worker fails them before sending any provider request; the dashboard displays the expiry when present.
 

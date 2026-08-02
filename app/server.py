@@ -63,6 +63,7 @@ PUBLISHING_LEASE_SECONDS = 5 * 60
 DEFAULT_AUDIT_RETENTION_DAYS = 365
 SESSION_SECONDS = 60 * 60 * 24 * 14
 OIDC_STATE_SECONDS = 10 * 60
+SOCIAL_OAUTH_STATE_SECONDS = 10 * 60
 AUTH_REQUESTS_PER_MINUTE = 10
 WRITE_REQUESTS_PER_MINUTE = 60
 CHANNELS = ("Facebook", "Instagram", "Threads", "X", "Telegram")
@@ -355,6 +356,16 @@ def setup_database() -> None:
                 expires_at TEXT NOT NULL
             )"""
         )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS social_oauth_states (
+                state TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                code_verifier TEXT,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )"""
+        )
         for name, definition in (
             ("image_url", "TEXT"), ("published_at", "TEXT"), ("external_id", "TEXT"),
             ("attempts", "INTEGER NOT NULL DEFAULT 0"), ("last_error", "TEXT"), ("user_id", "INTEGER"),
@@ -404,6 +415,7 @@ def setup_database() -> None:
         connection.execute("CREATE INDEX IF NOT EXISTS posts_due_delivery ON posts(state, scheduled_for)")
         connection.execute("CREATE INDEX IF NOT EXISTS post_media_post ON post_media(post_id, position)")
         connection.execute("CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at)")
+        connection.execute("CREATE INDEX IF NOT EXISTS social_oauth_states_expiry ON social_oauth_states(expires_at)")
         connection.execute("CREATE INDEX IF NOT EXISTS deliveries_post ON deliveries(post_id, created_at)")
         if connection.execute("SELECT COUNT(*) FROM posts").fetchone()[0] == 0:
             connection.execute(
@@ -454,6 +466,7 @@ def cleanup_expired_records() -> None:
     with db() as connection:
         connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (now(),))
         connection.execute("DELETE FROM oidc_states WHERE expires_at <= ?", (now(),))
+        connection.execute("DELETE FROM social_oauth_states WHERE expires_at <= ?", (now(),))
         connection.execute("DELETE FROM audit_events WHERE created_at < ?", ((datetime.now(UTC) - timedelta(days=retention_days)).isoformat(),))
 
 
@@ -522,6 +535,91 @@ def oidc_redirect_uri() -> str:
     if not base.startswith("https://"):
         raise ProviderError("SSO requires SOSOPO_PUBLIC_URL with a public HTTPS URL.")
     return f"{base}/api/auth/oidc/callback"
+
+
+def social_oauth_redirect_uri() -> str:
+    base = public_url()
+    if not base.startswith("https://"):
+        raise ProviderError("Social account connection requires SOSOPO_PUBLIC_URL with a public HTTPS URL.")
+    return f"{base}/api/social-oauth/callback"
+
+
+def social_oauth_settings(provider: str) -> dict[str, str]:
+    settings = {
+        "Facebook": {"client_id": config("FACEBOOK_OAUTH_CLIENT_ID"), "client_secret": config("FACEBOOK_OAUTH_CLIENT_SECRET"), "authorize": config("FACEBOOK_OAUTH_AUTHORIZE_URL") or "https://www.facebook.com/v24.0/dialog/oauth", "token": config("FACEBOOK_OAUTH_TOKEN_URL") or "https://graph.facebook.com/v24.0/oauth/access_token", "scopes": "pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish"},
+        "Threads": {"client_id": config("THREADS_OAUTH_CLIENT_ID"), "client_secret": config("THREADS_OAUTH_CLIENT_SECRET"), "authorize": config("THREADS_OAUTH_AUTHORIZE_URL") or "https://threads.net/oauth/authorize", "token": config("THREADS_OAUTH_TOKEN_URL") or "https://graph.threads.net/oauth/access_token", "scopes": "threads_basic,threads_content_publish"},
+        "X": {"client_id": config("X_OAUTH_CLIENT_ID"), "client_secret": config("X_OAUTH_CLIENT_SECRET"), "authorize": config("X_OAUTH_AUTHORIZE_URL") or "https://x.com/i/oauth2/authorize", "token": config("X_OAUTH_TOKEN_URL") or "https://api.x.com/2/oauth2/token", "scopes": "tweet.read,tweet.write,users.read,offline.access"},
+    }.get(provider)
+    if not settings or not settings["client_id"] or not settings["client_secret"]:
+        raise ProviderError(f"{provider} OAuth is not configured by this Sosopo administrator.")
+    return settings
+
+
+def social_oauth_enabled(provider: str) -> bool:
+    try:
+        social_oauth_settings(provider)
+        return True
+    except ProviderError:
+        return False
+
+
+def social_token_expiry(token: dict[str, Any]) -> str | None:
+    try:
+        seconds = int(token.get("expires_in", 0))
+        return (datetime.now(UTC) + timedelta(seconds=seconds)).isoformat() if seconds > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def social_oauth_connections(provider: str, settings: dict[str, str], code: str, verifier: str | None) -> list[dict[str, str]]:
+    redirect_uri = social_oauth_redirect_uri()
+    payload = {"grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri, "client_id": settings["client_id"], "client_secret": settings["client_secret"]}
+    if provider == "X":
+        payload["code_verifier"] = verifier or ""
+    token = request_form(settings["token"], payload)
+    access_token = str(token.get("access_token") or "")
+    if not access_token:
+        raise ProviderError("The provider did not return an access token.")
+    expiry = social_token_expiry(token)
+    if provider == "Facebook":
+        base = config("META_GRAPH_BASE_URL") or "https://graph.facebook.com/v24.0"
+        pages = request_get_json(f"{base}/me/accounts?{urlencode({'fields': 'id,name,access_token,instagram_business_account{id,username}', 'access_token': access_token})}").get("data", [])
+        records: list[dict[str, str]] = []
+        for page in pages if isinstance(pages, list) else []:
+            if not isinstance(page, dict) or not page.get("id") or not page.get("access_token"):
+                continue
+            records.append({"provider": "Facebook", "external_account_id": str(page["id"]), "display_name": str(page.get("name") or page["id"]), "access_token": str(page["access_token"]), "token_expires_at": expiry or ""})
+            instagram = page.get("instagram_business_account")
+            if isinstance(instagram, dict) and instagram.get("id"):
+                records.append({"provider": "Instagram", "external_account_id": str(instagram["id"]), "display_name": str(instagram.get("username") or page.get("name") or instagram["id"]), "access_token": str(page["access_token"]), "token_expires_at": expiry or ""})
+        if not records:
+            raise ProviderError("No managed Facebook Pages were returned. Confirm that the account manages a Page and approved page permissions.")
+        return records
+    if provider == "Threads":
+        base = config("THREADS_API_BASE_URL") or "https://graph.threads.net/v1.0"
+        profile = request_get_json(f"{base}/me?{urlencode({'fields': 'id,username', 'access_token': access_token})}")
+        if not profile.get("id"):
+            raise ProviderError("Threads did not return a profile.")
+        return [{"provider": "Threads", "external_account_id": str(profile["id"]), "display_name": str(profile.get("username") or profile["id"]), "access_token": access_token, "token_expires_at": expiry or ""}]
+    profile = request_get_json("https://api.x.com/2/users/me", {"Authorization": f"Bearer {access_token}"}).get("data", {})
+    if not isinstance(profile, dict) or not profile.get("id"):
+        raise ProviderError("X did not return a user profile.")
+    return [{"provider": "X", "external_account_id": str(profile["id"]), "display_name": str(profile.get("username") or profile.get("name") or profile["id"]), "access_token": access_token, "token_expires_at": expiry or ""}]
+
+
+def save_social_connections(user_id: int, records: list[dict[str, str]]) -> int:
+    saved = 0
+    with db() as connection:
+        for record in records:
+            existing = connection.execute("SELECT id FROM connections WHERE user_id = ? AND provider = ? AND external_account_id = ?", (user_id, record["provider"], record["external_account_id"])).fetchone()
+            encrypted = encrypt_secrets({"access_token": record["access_token"]})
+            expiry = record["token_expires_at"] or None
+            if existing:
+                connection.execute("UPDATE connections SET display_name = ?, encrypted_secrets = ?, token_expires_at = ?, is_active = 1 WHERE id = ?", (record["display_name"], encrypted, expiry, existing["id"]))
+            else:
+                connection.execute("INSERT INTO connections (user_id, provider, external_account_id, display_name, encrypted_secrets, settings_json, token_expires_at, created_at) VALUES (?, ?, ?, ?, ?, '{}', ?, ?)", (user_id, record["provider"], record["external_account_id"], record["display_name"], encrypted, expiry, now()))
+            saved += 1
+    return saved
 
 
 def verify_oidc_id_token(token: object, settings: dict[str, str], nonce: str) -> dict[str, Any]:
@@ -629,8 +727,8 @@ def request_json(url: str, payload: dict[str, Any], headers: dict[str, str] | No
         raise ProviderError(f"Provider could not be reached: {error.reason}", retryable=True) from error
 
 
-def request_form(url: str, payload: dict[str, str]) -> dict[str, Any]:
-    request = Request(url, data=urlencode(payload).encode(), method="POST", headers={"Content-Type": "application/x-www-form-urlencoded"})
+def request_form(url: str, payload: dict[str, str], headers: dict[str, str] | None = None) -> dict[str, Any]:
+    request = Request(url, data=urlencode(payload).encode(), method="POST", headers={"Content-Type": "application/x-www-form-urlencoded", **(headers or {})})
     try:
         with urlopen(request, timeout=30) as response:
             return json.loads(response.read() or b"{}")
@@ -640,6 +738,20 @@ def request_form(url: str, payload: dict[str, str]) -> dict[str, Any]:
         raise ProviderError(f"Provider rejected the post ({error.code}): {error.read().decode(errors='replace')[:500]}", retryable=retryable, retry_after=retry_after) from error
     except URLError as error:
         raise ProviderError(f"Provider could not be reached: {error.reason}", retryable=True) from error
+
+
+def request_get_json(url: str, headers: dict[str, str] | None = None) -> dict[str, Any]:
+    request = Request(url, headers=headers or {})
+    try:
+        with urlopen(request, timeout=30) as response:
+            result = json.loads(response.read() or b"{}")
+    except HTTPError as error:
+        raise ProviderError(f"Provider rejected account discovery ({error.code}): {error.read().decode(errors='replace')[:500]}", retryable=error.code == HTTPStatus.TOO_MANY_REQUESTS or error.code >= HTTPStatus.INTERNAL_SERVER_ERROR) from error
+    except (URLError, json.JSONDecodeError) as error:
+        raise ProviderError("Provider account discovery could not be completed.", retryable=True) from error
+    if not isinstance(result, dict):
+        raise ProviderError("Provider account discovery returned an invalid response.")
+    return result
 
 
 def parse_retry_after(value: str) -> int | None:
@@ -1039,6 +1151,24 @@ class Handler(SimpleHTTPRequestHandler):
                 elif not user["is_active"]:
                     self._json({"error": "This user account is disabled."}, HTTPStatus.FORBIDDEN); return
             self._redirect_session("/", self._create_session(user["id"])); return
+        if path == "/api/social-oauth/callback":
+            values = parse_qs(urlparse(self.path).query)
+            provider, state, code = values.get("provider", [""])[0], values.get("state", [""])[0], values.get("code", [""])[0]
+            if provider not in {"Facebook", "Threads", "X"} or not state or not code:
+                self._json({"error": "Invalid social account callback."}, HTTPStatus.BAD_REQUEST); return
+            with db() as connection:
+                stored = connection.execute("SELECT * FROM social_oauth_states WHERE state = ? AND provider = ? AND expires_at > ?", (state, provider, now())).fetchone()
+                connection.execute("DELETE FROM social_oauth_states WHERE state = ?", (state,))
+            if stored is None:
+                self._json({"error": "Expired or invalid social account connection state."}, HTTPStatus.BAD_REQUEST); return
+            try:
+                records = social_oauth_connections(provider, social_oauth_settings(provider), code, stored["code_verifier"])
+                saved = save_social_connections(stored["user_id"], records)
+                audit(stored["user_id"], "connection.oauth_connected", "connection", None, f"Connected {saved} account(s) through {provider} OAuth", self._source_ip())
+                self.send_response(HTTPStatus.FOUND); self.send_header("Location", "/?connected=" + urlencode({"provider": provider, "accounts": saved})); self.end_headers()
+            except ProviderError as error:
+                self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return
         if path == "/api/health":
             try:
                 with db() as connection:
@@ -1049,13 +1179,31 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path.startswith("/api/") and self._require_auth() is None:
             return
+        if path.startswith("/api/social-oauth/") and path.endswith("/start"):
+            provider = path.split("/")[3]
+            if provider not in {"Facebook", "Threads", "X"}:
+                self._json({"error": "Unsupported social OAuth provider."}, HTTPStatus.NOT_FOUND); return
+            try:
+                session, settings = self._session(), social_oauth_settings(provider)
+                state, verifier = secrets.token_urlsafe(32), secrets.token_urlsafe(64)
+                with db() as connection:
+                    connection.execute("DELETE FROM social_oauth_states WHERE expires_at <= ?", (now(),))
+                    connection.execute("INSERT INTO social_oauth_states (state, provider, user_id, code_verifier, expires_at) VALUES (?, ?, ?, ?, ?)", (state, provider, session["user_id"], verifier if provider == "X" else None, (datetime.now(UTC) + timedelta(seconds=SOCIAL_OAUTH_STATE_SECONDS)).isoformat()))
+                query = {"client_id": settings["client_id"], "redirect_uri": social_oauth_redirect_uri(), "response_type": "code", "scope": settings["scopes"], "state": state}
+                if provider == "X":
+                    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+                    query.update({"code_challenge": challenge, "code_challenge_method": "S256"})
+                self.send_response(HTTPStatus.FOUND); self.send_header("Location", f"{settings['authorize']}?{urlencode(query)}"); self.end_headers()
+            except ProviderError as error:
+                self._json({"error": str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return
         if path == "/api/dashboard":
             session = self._session()
             with db() as connection:
                 posts = [dict(row) for row in connection.execute("SELECT * FROM posts WHERE user_id = ? ORDER BY CASE state WHEN 'scheduled' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, scheduled_for, id DESC", (session["user_id"],)).fetchall()]
                 for post in posts:
                     post["media_urls"] = [row["media_url"] for row in connection.execute("SELECT media_url FROM post_media WHERE post_id = ? ORDER BY position", (post["id"],)).fetchall()] or ([post["image_url"]] if post.get("image_url") else [])
-            self._json({"posts": posts, "providers": [{"name": channel, "status": provider_status(channel)} for channel in CHANNELS]})
+            self._json({"posts": posts, "providers": [{"name": channel, "status": provider_status(channel), "oauth_available": social_oauth_enabled(channel)} for channel in CHANNELS]})
             return
         if path == "/api/admin/users":
             session = self._session()
