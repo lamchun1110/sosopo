@@ -6,7 +6,7 @@ Licensed under [MIT](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) for local 
 
 ## What works today
 
-- Create drafts for Facebook, Instagram, Threads, X, and Telegram.
+- Create drafts for Facebook, Instagram, Threads, X, Telegram, Discord, and LinkedIn.
 - Schedule a post in any IANA timezone (for example `Asia/Hong_Kong` or `Europe/London`); it is stored as UTC for reliable delivery.
 - Upload one byte-validated PNG, JPEG, GIF, or WebP image per post (maximum 5 MB).
 - Publish immediately or through the built-in scheduler after a provider is configured.
@@ -14,11 +14,11 @@ Licensed under [MIT](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) for local 
 - Persist posts, schedules, and uploads in `./data`.
 - Check service readiness at `GET /api/health`.
 
-Provider credentials are not included. On first visit, create the local administrator account (minimum 12-character password). The administrator can provision local users through the protected API; OpenID Connect can automatically provision ordinary users when explicitly enabled. The dashboard supports encrypted manual account entry and multi-account targets; provider OAuth account discovery remains future work.
+Provider credentials are not included. On first visit, create the local administrator account (minimum 12-character password). The administrator can provision local users through the protected API; OpenID Connect can automatically provision ordinary users when explicitly enabled. The dashboard supports encrypted manual account entry, multi-account targets, and OAuth account connection for Facebook, Threads, X, and LinkedIn.
 
 First-run setup is single-use and atomically guarded: only one initial administrator can be created, even if several browsers open a fresh instance simultaneously.
 
-Sosopo rejects known-invalid posts before scheduling: Instagram requires an image; text limits are Facebook 5,000, Instagram 2,200, Threads 500, X 280, and Telegram 4,096 characters. Provider plans and API policies can change, so use provider sandbox validation before relying on any limit for a large-scale workflow.
+Sosopo rejects known-invalid posts before scheduling: Instagram requires an image; text limits are Facebook 5,000, Instagram 2,200, Threads 500, X 280, Telegram 4,096, Discord 2,000, and LinkedIn 3,000 characters. LinkedIn publishing is text-only in this release. Provider plans and API policies can change, so use provider sandbox validation before relying on any limit for a large-scale workflow.
 
 ## Run with Docker Compose
 
@@ -74,17 +74,17 @@ Local disk (`SOSOPO_STORAGE_BACKEND=local`) is the default and stores uploads in
 
 ### Account connections
 
-One owner can hold multiple Facebook Pages, Instagram accounts, Threads profiles, X accounts, or Telegram channels. Connection secrets are encrypted with Fernet before being written to the database and are never returned by the API. The composer can select several platforms and one or more connected accounts per platform in a single post. Delivery is independently recorded for each account, so a failure on one destination can be retried without reposting to accounts that already succeeded. A single-platform post may still use legacy environment credentials when no connected account is selected.
+One owner can hold multiple Facebook Pages, Instagram accounts, Threads profiles, X accounts, Telegram channels, Discord webhooks, or LinkedIn authors. Connection secrets are encrypted with Fernet before being written to the database and are never returned by the API. The composer can select several platforms and one or more connected accounts per platform in a single post. Delivery is independently recorded for each account, so a failure on one destination can be retried without reposting to accounts that already succeeded. A single-platform post may still use legacy environment credentials when no connected account is selected.
 
 Posts can include up to 10 images, with provider-specific limits checked before saving (X accepts up to 4). Sosopo stores the attachments in their selected order and sends provider carousel/media-group requests where supported. Images are decoded and validated on upload. Use public HTTPS media storage because providers must be able to fetch scheduled attachments.
 
 The publish timezone is an IANA timezone dropdown populated by the browser (for example `Asia/Hong_Kong`). Sosopo converts the chosen local date/time to UTC and stores the selected timezone with the post.
 
-The dashboard's **Connected accounts** form creates and disables account records. The underlying `POST /api/connections` API requires a signed-in session plus its CSRF token and accepts a provider, display name, external account ID, optional settings, and provider secrets. Use `access_token` for Facebook, Instagram, Threads, and X; use `bot_token` for Telegram. `external_account_id` is the Page/account/profile ID (or Telegram chat/channel ID). Manual encrypted token entry remains available for providers or environments where OAuth is not configured.
+The dashboard's **Connected accounts** form creates and disables account records. The underlying `POST /api/connections` API requires a signed-in session plus its CSRF token and accepts a provider, display name, external account ID, optional settings, and provider secrets. Use `access_token` for Facebook, Instagram, Threads, X, and LinkedIn; use `bot_token` for Telegram; use `webhook_url` for Discord. `external_account_id` is the Page/account/profile ID, LinkedIn author URN, or Telegram chat/channel ID. For Discord, paste the full incoming webhook URL: Sosopo derives and stores only its webhook ID outside the encrypted secret. Manual encrypted credential entry remains available for providers or environments where OAuth is not configured.
 
 ### OAuth account connection
 
-For a no-copy connection experience, configure an OAuth application once per Sosopo instance. Signed-in users can then use **Connect** beside Facebook, Threads, or X; Sosopo redirects to the provider, verifies a short-lived one-time state, discovers the available account(s), and stores the returned credentials encrypted. Facebook connection also discovers linked Instagram professional accounts.
+For a no-copy connection experience, configure an OAuth application once per Sosopo instance. Signed-in users can then use **Connect** beside Facebook, Threads, X, or LinkedIn; Sosopo redirects to the provider, verifies a short-lived one-time state, discovers the available account(s), and stores the returned credentials encrypted. Facebook connection also discovers linked Instagram professional accounts.
 
 Set the matching client ID and client secret from `.env.example`, then register this exact HTTPS redirect URL in each provider app:
 
@@ -92,7 +92,7 @@ Set the matching client ID and client secret from `.env.example`, then register 
 https://your-sosopo-domain.example/api/social-oauth/callback
 ```
 
-For Meta, request the Page and Instagram publishing permissions listed in `.env.example` and ensure the signing-in person manages the Page. Meta production use can require app review and business verification. For X, configure OAuth 2.0 Authorization Code with PKCE and user-context posting access. Telegram continues to use a BotFather token and channel/chat ID because its Bot API has no equivalent account-approval flow.
+For Meta, request the Page and Instagram publishing permissions listed in `.env.example` and ensure the signing-in person manages the Page. Meta production use can require app review and business verification. For X, configure OAuth 2.0 Authorization Code with PKCE and user-context posting access. LinkedIn member OAuth uses `w_member_social`; organization Page posting needs the separately approved `w_organization_social` permission and a manual organization URN. Discord uses a per-channel incoming webhook rather than a user login. Telegram continues to use a BotFather token and channel/chat ID because its Bot API has no equivalent account-approval flow.
 
 ### Create provider apps and bots
 
@@ -122,6 +122,23 @@ Users then select **Connect** beside Facebook in Sosopo, sign in to Meta, approv
 3. Set `X_OAUTH_CLIENT_ID` and `X_OAUTH_CLIENT_SECRET`.
 4. Enable at least `tweet.read`, `tweet.write`, `users.read`, and `offline.access`, then use **Connect** beside X.
 
+#### LinkedIn
+
+1. Create a LinkedIn developer application and add the **Share on LinkedIn** product.
+2. Register `https://your-sosopo-domain.example/api/social-oauth/callback` as its OAuth redirect URL.
+3. Set `LINKEDIN_OAUTH_CLIENT_ID`, `LINKEDIN_OAUTH_CLIENT_SECRET`, and the current `LINKEDIN_API_VERSION` in `.env`.
+4. Use **Connect** beside LinkedIn to authorize a member profile with `w_member_social` and add it to Sosopo.
+
+Member publishing is available through OAuth and is text-only in this release. To publish as a LinkedIn organization, obtain the required LinkedIn organization access, then add a manual encrypted connection with the organization `urn:li:organization:...` and a token with `w_organization_social`. Sosopo does not discover organization Pages automatically because that permission is not self-service for every LinkedIn app.
+
+#### Discord
+
+1. In the target Discord server, open the channel settings, then **Integrations** → **Webhooks** → **New Webhook**.
+2. Choose the channel, copy the full webhook URL, and treat it like a password.
+3. In Sosopo, choose Discord under **Connect an account**, give it a friendly name, and paste that URL in **Incoming webhook URL**.
+
+Discord does not require a bot or user OAuth login for this mode. One webhook equals one destination channel; add more webhook connections to publish to multiple Discord channels. Sosopo sends text and up to ten public image URLs as webhook embeds.
+
 #### Telegram
 
 1. Open `@BotFather` in Telegram and run `/newbot`.
@@ -143,11 +160,13 @@ Replace an expired or compromised credential using the dashboard's **Rotate toke
 | Instagram | Meta OAuth client credentials or `INSTAGRAM_ACCOUNT_ID`, `INSTAGRAM_ACCESS_TOKEN`; `SOSOPO_PUBLIC_URL` for images | Image and carousel posts. Image is required. |
 | Threads | OAuth client credentials or `THREADS_USER_ID`, `THREADS_ACCESS_TOKEN`; `SOSOPO_PUBLIC_URL` for images | Text, image, and carousel posts. |
 | X | OAuth client credentials or `X_ACCESS_TOKEN` | Text and up to four images. |
+| LinkedIn | OAuth client credentials or `LINKEDIN_AUTHOR_URN`, `LINKEDIN_ACCESS_TOKEN`, `LINKEDIN_API_VERSION` | OAuth member publishing and manual organization URNs; text-only. |
+| Discord | A manually connected incoming webhook or `DISCORD_WEBHOOK_URL` | Text and up to ten image embeds per webhook/channel. |
 | Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` or a manually connected bot | Text and multi-image messages; the bot must be an administrator of the target channel/group. |
 
 Facebook and Instagram use `META_GRAPH_BASE_URL` (default shown in `.env.example`); Threads uses `THREADS_API_BASE_URL`. Keep API versions configurable and review provider changelogs before upgrading.
 
-For Facebook, Instagram, and Threads, create and approve the corresponding Meta developer app and obtain long-lived tokens with the required publishing permissions. Their servers fetch an attached image directly, so `SOSOPO_PUBLIC_URL` must be a publicly reachable HTTPS address—not `localhost`. X needs an approved developer project and a user-context access token. Telegram is configured through BotFather plus a target chat/channel ID. See the official [Meta Graph API documentation](https://developers.facebook.com/docs/graph-api/), [Threads API documentation](https://developers.facebook.com/docs/threads/), [X post management guide](https://docs.x.com/x-api/posts/manage-tweets/introduction), and [Telegram Bot API](https://core.telegram.org/bots/api).
+For Facebook, Instagram, and Threads, create and approve the corresponding Meta developer app and obtain long-lived tokens with the required publishing permissions. Their servers fetch an attached image directly, so `SOSOPO_PUBLIC_URL` must be a publicly reachable HTTPS address—not `localhost`. X needs an approved developer project and a user-context access token. LinkedIn uses the versioned Posts API and its Share on LinkedIn product. Discord is configured by a per-channel incoming webhook. Telegram is configured through BotFather plus a target chat/channel ID. See the official [Meta Graph API documentation](https://developers.facebook.com/docs/graph-api/), [Threads API documentation](https://developers.facebook.com/docs/threads/), [X post management guide](https://docs.x.com/x-api/posts/manage-tweets/introduction), [LinkedIn Posts API](https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/posts-api?view=li-lms-2024-10), [Discord webhook resource](https://docs.discord.com/developers/resources/webhook), and [Telegram Bot API](https://core.telegram.org/bots/api).
 
 The container runs as a non-root user. On Linux, ensure the host `data/` directory is writable by container UID `10001` before starting it:
 

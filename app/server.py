@@ -11,6 +11,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -66,10 +67,10 @@ OIDC_STATE_SECONDS = 10 * 60
 SOCIAL_OAUTH_STATE_SECONDS = 10 * 60
 AUTH_REQUESTS_PER_MINUTE = 10
 WRITE_REQUESTS_PER_MINUTE = 60
-CHANNELS = ("Facebook", "Instagram", "Threads", "X", "Telegram")
+CHANNELS = ("Facebook", "Instagram", "Threads", "X", "Telegram", "Discord", "LinkedIn")
 IMAGE_TYPES = {"image/gif": ".gif", "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
-CHANNEL_CHARACTER_LIMITS = {"Facebook": 5_000, "Instagram": 2_200, "Threads": 500, "X": 280, "Telegram": 4_096}
-CHANNEL_MEDIA_LIMITS = {"Facebook": 10, "Instagram": 10, "Threads": 10, "X": 4, "Telegram": 10}
+CHANNEL_CHARACTER_LIMITS = {"Facebook": 5_000, "Instagram": 2_200, "Threads": 500, "X": 280, "Telegram": 4_096, "Discord": 2_000, "LinkedIn": 3_000}
+CHANNEL_MEDIA_LIMITS = {"Facebook": 10, "Instagram": 10, "Threads": 10, "X": 4, "Telegram": 10, "Discord": 10, "LinkedIn": 0}
 LOGGER = logging.getLogger("sosopo")
 RATE_LIMITS: dict[tuple[str, str], list[float]] = {}
 RATE_LIMIT_LOCK = threading.Lock()
@@ -549,6 +550,7 @@ def social_oauth_settings(provider: str) -> dict[str, str]:
         "Facebook": {"client_id": config("FACEBOOK_OAUTH_CLIENT_ID"), "client_secret": config("FACEBOOK_OAUTH_CLIENT_SECRET"), "authorize": config("FACEBOOK_OAUTH_AUTHORIZE_URL") or "https://www.facebook.com/v24.0/dialog/oauth", "token": config("FACEBOOK_OAUTH_TOKEN_URL") or "https://graph.facebook.com/v24.0/oauth/access_token", "scopes": "pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish"},
         "Threads": {"client_id": config("THREADS_OAUTH_CLIENT_ID"), "client_secret": config("THREADS_OAUTH_CLIENT_SECRET"), "authorize": config("THREADS_OAUTH_AUTHORIZE_URL") or "https://threads.net/oauth/authorize", "token": config("THREADS_OAUTH_TOKEN_URL") or "https://graph.threads.net/oauth/access_token", "scopes": "threads_basic,threads_content_publish"},
         "X": {"client_id": config("X_OAUTH_CLIENT_ID"), "client_secret": config("X_OAUTH_CLIENT_SECRET"), "authorize": config("X_OAUTH_AUTHORIZE_URL") or "https://x.com/i/oauth2/authorize", "token": config("X_OAUTH_TOKEN_URL") or "https://api.x.com/2/oauth2/token", "scopes": "tweet.read,tweet.write,users.read,offline.access"},
+        "LinkedIn": {"client_id": config("LINKEDIN_OAUTH_CLIENT_ID"), "client_secret": config("LINKEDIN_OAUTH_CLIENT_SECRET"), "authorize": config("LINKEDIN_OAUTH_AUTHORIZE_URL") or "https://www.linkedin.com/oauth/v2/authorization", "token": config("LINKEDIN_OAUTH_TOKEN_URL") or "https://www.linkedin.com/oauth/v2/accessToken", "scopes": "openid profile w_member_social"},
     }.get(provider)
     if not settings or not settings["client_id"] or not settings["client_secret"]:
         raise ProviderError(f"{provider} OAuth is not configured by this Sosopo administrator.")
@@ -601,6 +603,13 @@ def social_oauth_connections(provider: str, settings: dict[str, str], code: str,
         if not profile.get("id"):
             raise ProviderError("Threads did not return a profile.")
         return [{"provider": "Threads", "external_account_id": str(profile["id"]), "display_name": str(profile.get("username") or profile["id"]), "access_token": access_token, "token_expires_at": expiry or ""}]
+    if provider == "LinkedIn":
+        profile = request_get_json("https://api.linkedin.com/v2/userinfo", {"Authorization": f"Bearer {access_token}"})
+        subject = str(profile.get("sub") or "")
+        if not subject:
+            raise ProviderError("LinkedIn did not return a member profile.")
+        author = subject if subject.startswith("urn:li:") else f"urn:li:person:{subject}"
+        return [{"provider": "LinkedIn", "external_account_id": author, "display_name": str(profile.get("name") or profile.get("given_name") or subject), "access_token": access_token, "token_expires_at": expiry or ""}]
     profile = request_get_json("https://api.x.com/2/users/me", {"Authorization": f"Bearer {access_token}"}).get("data", {})
     if not isinstance(profile, dict) or not profile.get("id"):
         raise ProviderError("X did not return a user profile.")
@@ -794,6 +803,31 @@ def publish(post: dict[str, Any], account: dict[str, Any] | None = None) -> str:
     account_id = str(account["external_account_id"]) if account else ""
     def credential(name: str, environment: str) -> str:
         return secrets_for_account.get(name, "") or config(environment)
+    if channel == "Discord":
+        webhook_url = credential("webhook_url", "DISCORD_WEBHOOK_URL")
+        if not webhook_url.startswith("https://discord.com/api/webhooks/") and not webhook_url.startswith("https://discordapp.com/api/webhooks/"):
+            raise ProviderError("Discord needs a valid incoming webhook URL.", retryable=False)
+        embeds = [{"image": {"url": public_image_url(url)}} for url in image_urls]
+        result = request_json(f"{webhook_url}?wait=true", {"content": body, "embeds": embeds, "allowed_mentions": {"parse": []}})
+        return str(result.get("id") or "")
+    if channel == "LinkedIn":
+        author, token = account_id or credential("author_urn", "LINKEDIN_AUTHOR_URN"), credential("access_token", "LINKEDIN_ACCESS_TOKEN")
+        version = config("LINKEDIN_API_VERSION")
+        if not author or not token or not version:
+            raise ProviderError("LinkedIn needs LINKEDIN_AUTHOR_URN, LINKEDIN_ACCESS_TOKEN, and LINKEDIN_API_VERSION.")
+        if not author.startswith("urn:li:"):
+            raise ProviderError("LinkedIn author must be a member or organization URN.", retryable=False)
+        if image_urls:
+            raise ProviderError("LinkedIn image publishing is not available yet; publish text only.", retryable=False)
+        result = request_json("https://api.linkedin.com/rest/posts", {
+            "author": author,
+            "commentary": body,
+            "visibility": "PUBLIC",
+            "distribution": {"feedDistribution": "MAIN_FEED", "targetEntities": [], "thirdPartyDistributionChannels": []},
+            "lifecycleState": "PUBLISHED",
+            "isReshareDisabledByAuthor": False,
+        }, {"Authorization": f"Bearer {token}", "LinkedIn-Version": version, "X-Restli-Protocol-Version": "2.0.0"})
+        return str(result.get("id") or "linkedin-posted")
     if channel == "Telegram":
         token, chat_id = credential("bot_token", "TELEGRAM_BOT_TOKEN"), account_id or credential("chat_id", "TELEGRAM_CHAT_ID")
         if not token or not chat_id:
@@ -899,6 +933,8 @@ def provider_status(channel: str) -> str:
         "Threads": ("THREADS_USER_ID", "THREADS_ACCESS_TOKEN"),
         "X": ("X_ACCESS_TOKEN",),
         "Telegram": ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"),
+        "Discord": ("DISCORD_WEBHOOK_URL",),
+        "LinkedIn": ("LINKEDIN_AUTHOR_URN", "LINKEDIN_ACCESS_TOKEN", "LINKEDIN_API_VERSION"),
     }[channel]
     return "ready" if all(config(item) for item in required) else "needs configuration"
 
@@ -1154,7 +1190,7 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/social-oauth/callback":
             values = parse_qs(urlparse(self.path).query)
             provider, state, code = values.get("provider", [""])[0], values.get("state", [""])[0], values.get("code", [""])[0]
-            if provider not in {"Facebook", "Threads", "X"} or not state or not code:
+            if provider not in {"Facebook", "Threads", "X", "LinkedIn"} or not state or not code:
                 self._json({"error": "Invalid social account callback."}, HTTPStatus.BAD_REQUEST); return
             with db() as connection:
                 stored = connection.execute("SELECT * FROM social_oauth_states WHERE state = ? AND provider = ? AND expires_at > ?", (state, provider, now())).fetchone()
@@ -1181,7 +1217,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path.startswith("/api/social-oauth/") and path.endswith("/start"):
             provider = path.split("/")[3]
-            if provider not in {"Facebook", "Threads", "X"}:
+            if provider not in {"Facebook", "Threads", "X", "LinkedIn"}:
                 self._json({"error": "Unsupported social OAuth provider."}, HTTPStatus.NOT_FOUND); return
             try:
                 session, settings = self._session(), social_oauth_settings(provider)
@@ -1373,6 +1409,13 @@ class Handler(SimpleHTTPRequestHandler):
                 if provider not in CHANNELS or not account_id or not display_name or not isinstance(secret_values, dict) or not isinstance(settings, dict):
                     self._json({"error": "Provider, account ID, display name, secrets, and settings are required."}, HTTPStatus.BAD_REQUEST); return
                 secrets_to_store = {str(key): str(value) for key, value in secret_values.items() if value}
+                if provider == "Discord":
+                    webhook_url = secrets_to_store.get("webhook_url") or account_id
+                    match = re.fullmatch(r"https://(?:discord(?:app)?\.com)/api/webhooks/(\d+)/[^/?#]+/?", webhook_url)
+                    if not match:
+                        self._json({"error": "Enter a valid Discord incoming webhook URL."}, HTTPStatus.BAD_REQUEST); return
+                    account_id = match.group(1)
+                    secrets_to_store = {"webhook_url": webhook_url}
                 token_expiry = str(payload.get("token_expires_at", "")).strip() or None
                 if token_expiry and token_is_expired(token_expiry):
                     self._json({"error": "token_expires_at must be a future ISO 8601 timestamp with timezone."}, HTTPStatus.BAD_REQUEST); return

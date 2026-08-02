@@ -36,6 +36,26 @@ class SosopoTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.server.Handler._schedule_time("2020-01-01T09:30", "UTC")
 
+    def test_discord_and_linkedin_provider_validation(self) -> None:
+        s = self.server
+        s.validate_post("Discord", "hello", None)
+        s.validate_post("LinkedIn", "hello", None)
+        with self.assertRaisesRegex(ValueError, "LinkedIn supports up to 0 images"):
+            s.validate_post("LinkedIn", "hello", "/uploads/image.png", 1)
+
+    def test_discord_publish_uses_encrypted_webhook_connection(self) -> None:
+        s = self.server
+        captured: dict[str, object] = {}
+        original_request_json = s.request_json
+        s.request_json = lambda url, payload, headers=None: captured.update(url=url, payload=payload) or {"id": "discord-message"}
+        try:
+            result = s.publish({"body": "hello", "channel": "Discord", "media_urls": []}, {"provider": "Discord", "external_account_id": "123", "encrypted_secrets": s.encrypt_secrets({"webhook_url": "https://discord.com/api/webhooks/123/secret"})})
+        finally:
+            s.request_json = original_request_json
+        self.assertEqual(result, "discord-message")
+        self.assertEqual(captured["url"], "https://discord.com/api/webhooks/123/secret?wait=true")
+        self.assertEqual(captured["payload"], {"content": "hello", "embeds": [], "allowed_mentions": {"parse": []}})
+
     def test_multi_account_worker_marks_each_target_published(self) -> None:
         s = self.server
         with s.db() as connection:
