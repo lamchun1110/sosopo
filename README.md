@@ -84,7 +84,7 @@ The dashboard's **Connected accounts** form creates and disables account records
 
 ### OAuth account connection
 
-For a no-copy connection experience, configure an OAuth application once per Sosopo instance. Signed-in users can then use **Connect** beside Facebook, Threads, X, or LinkedIn; Sosopo redirects to the provider, verifies a short-lived one-time state, discovers the available account(s), and stores the returned credentials encrypted. Facebook connection also discovers linked Instagram professional accounts.
+For a no-copy connection experience, configure an OAuth application once per Sosopo instance. Signed-in users can then use **Connect** beside Facebook, Threads, X, LinkedIn, or Discord; Sosopo redirects to the provider, verifies a short-lived one-time state, discovers the available account(s), and stores the returned credentials encrypted. Facebook connection also discovers linked Instagram professional accounts; Discord asks the user to choose a server channel and returns a webhook for it.
 
 Set the matching client ID and client secret from `.env.example`, then register this exact HTTPS redirect URL in each provider app:
 
@@ -92,7 +92,7 @@ Set the matching client ID and client secret from `.env.example`, then register 
 https://your-sosopo-domain.example/api/social-oauth/callback
 ```
 
-For Meta, request the Page and Instagram publishing permissions listed in `.env.example` and ensure the signing-in person manages the Page. Meta production use can require app review and business verification. For X, configure OAuth 2.0 Authorization Code with PKCE and user-context posting access. LinkedIn member OAuth uses `w_member_social`; organization Page posting needs the separately approved `w_organization_social` permission and a manual organization URN. Discord uses a per-channel incoming webhook rather than a user login. Telegram continues to use a BotFather token and channel/chat ID because its Bot API has no equivalent account-approval flow.
+For Meta, request the Page and Instagram publishing permissions listed in `.env.example` and ensure the signing-in person manages the Page. Meta production use can require app review and business verification. For X, configure OAuth 2.0 Authorization Code with PKCE and user-context posting access. LinkedIn member OAuth uses `w_member_social`; organization Page posting needs the separately approved `w_organization_social` permission and a manual organization URN. Discord uses an OAuth-approved per-channel incoming webhook. Telegram continues to use a BotFather token and channel/chat ID because its Bot API has no equivalent account-approval flow.
 
 ### Create provider apps and bots
 
@@ -133,11 +133,11 @@ Member publishing is available through OAuth and is text-only in this release. T
 
 #### Discord
 
-1. In the target Discord server, open the channel settings, then **Integrations** → **Webhooks** → **New Webhook**.
-2. Choose the channel, copy the full webhook URL, and treat it like a password.
-3. In Sosopo, choose Discord under **Connect an account**, give it a friendly name, and paste that URL in **Incoming webhook URL**.
+1. Create a Discord application in the [Developer Portal](https://discord.com/developers/applications) and add `https://your-sosopo-domain.example/api/social-oauth/callback` as its OAuth redirect URL.
+2. Set `DISCORD_OAUTH_CLIENT_ID` and `DISCORD_OAUTH_CLIENT_SECRET` in `.env`.
+3. In Sosopo, select **Connect** beside Discord. Discord will ask the user to choose a server and destination channel; after approval, Sosopo securely stores the returned webhook.
 
-Discord does not require a bot or user OAuth login for this mode. One webhook equals one destination channel; add more webhook connections to publish to multiple Discord channels. Sosopo sends text and up to ten public image URLs as webhook embeds.
+One OAuth approval creates one destination channel; repeat it to publish to multiple Discord channels. Sosopo sends text and up to ten public image URLs as webhook embeds. If a shared instance cannot create a Discord application, the **Connect an account** form still accepts a manually created incoming webhook URL as a fallback. Do not expose either type of webhook URL—it can post to that channel.
 
 #### Telegram
 

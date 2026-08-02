@@ -551,6 +551,7 @@ def social_oauth_settings(provider: str) -> dict[str, str]:
         "Threads": {"client_id": config("THREADS_OAUTH_CLIENT_ID"), "client_secret": config("THREADS_OAUTH_CLIENT_SECRET"), "authorize": config("THREADS_OAUTH_AUTHORIZE_URL") or "https://threads.net/oauth/authorize", "token": config("THREADS_OAUTH_TOKEN_URL") or "https://graph.threads.net/oauth/access_token", "scopes": "threads_basic,threads_content_publish"},
         "X": {"client_id": config("X_OAUTH_CLIENT_ID"), "client_secret": config("X_OAUTH_CLIENT_SECRET"), "authorize": config("X_OAUTH_AUTHORIZE_URL") or "https://x.com/i/oauth2/authorize", "token": config("X_OAUTH_TOKEN_URL") or "https://api.x.com/2/oauth2/token", "scopes": "tweet.read,tweet.write,users.read,offline.access"},
         "LinkedIn": {"client_id": config("LINKEDIN_OAUTH_CLIENT_ID"), "client_secret": config("LINKEDIN_OAUTH_CLIENT_SECRET"), "authorize": config("LINKEDIN_OAUTH_AUTHORIZE_URL") or "https://www.linkedin.com/oauth/v2/authorization", "token": config("LINKEDIN_OAUTH_TOKEN_URL") or "https://www.linkedin.com/oauth/v2/accessToken", "scopes": "openid profile w_member_social"},
+        "Discord": {"client_id": config("DISCORD_OAUTH_CLIENT_ID"), "client_secret": config("DISCORD_OAUTH_CLIENT_SECRET"), "authorize": config("DISCORD_OAUTH_AUTHORIZE_URL") or "https://discord.com/oauth2/authorize", "token": config("DISCORD_OAUTH_TOKEN_URL") or "https://discord.com/api/oauth2/token", "scopes": "webhook.incoming"},
     }.get(provider)
     if not settings or not settings["client_id"] or not settings["client_secret"]:
         raise ProviderError(f"{provider} OAuth is not configured by this Sosopo administrator.")
@@ -610,6 +611,12 @@ def social_oauth_connections(provider: str, settings: dict[str, str], code: str,
             raise ProviderError("LinkedIn did not return a member profile.")
         author = subject if subject.startswith("urn:li:") else f"urn:li:person:{subject}"
         return [{"provider": "LinkedIn", "external_account_id": author, "display_name": str(profile.get("name") or profile.get("given_name") or subject), "access_token": access_token, "token_expires_at": expiry or ""}]
+    if provider == "Discord":
+        webhook = token.get("webhook")
+        if not isinstance(webhook, dict) or not webhook.get("id") or not webhook.get("token"):
+            raise ProviderError("Discord did not return an approved channel webhook.")
+        webhook_id, webhook_token = str(webhook["id"]), str(webhook["token"])
+        return [{"provider": "Discord", "external_account_id": webhook_id, "display_name": str(webhook.get("name") or f"Discord channel {webhook.get('channel_id') or webhook_id}"), "access_token": f"https://discord.com/api/webhooks/{webhook_id}/{webhook_token}", "secret_name": "webhook_url", "token_expires_at": ""}]
     profile = request_get_json("https://api.x.com/2/users/me", {"Authorization": f"Bearer {access_token}"}).get("data", {})
     if not isinstance(profile, dict) or not profile.get("id"):
         raise ProviderError("X did not return a user profile.")
@@ -621,7 +628,7 @@ def save_social_connections(user_id: int, records: list[dict[str, str]]) -> int:
     with db() as connection:
         for record in records:
             existing = connection.execute("SELECT id FROM connections WHERE user_id = ? AND provider = ? AND external_account_id = ?", (user_id, record["provider"], record["external_account_id"])).fetchone()
-            encrypted = encrypt_secrets({"access_token": record["access_token"]})
+            encrypted = encrypt_secrets({str(record.get("secret_name") or "access_token"): record["access_token"]})
             expiry = record["token_expires_at"] or None
             if existing:
                 connection.execute("UPDATE connections SET display_name = ?, encrypted_secrets = ?, token_expires_at = ?, is_active = 1 WHERE id = ?", (record["display_name"], encrypted, expiry, existing["id"]))
@@ -1190,7 +1197,7 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/social-oauth/callback":
             values = parse_qs(urlparse(self.path).query)
             provider, state, code = values.get("provider", [""])[0], values.get("state", [""])[0], values.get("code", [""])[0]
-            if provider not in {"Facebook", "Threads", "X", "LinkedIn"} or not state or not code:
+            if provider not in {"Facebook", "Threads", "X", "LinkedIn", "Discord"} or not state or not code:
                 self._json({"error": "Invalid social account callback."}, HTTPStatus.BAD_REQUEST); return
             with db() as connection:
                 stored = connection.execute("SELECT * FROM social_oauth_states WHERE state = ? AND provider = ? AND expires_at > ?", (state, provider, now())).fetchone()
@@ -1217,7 +1224,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path.startswith("/api/social-oauth/") and path.endswith("/start"):
             provider = path.split("/")[3]
-            if provider not in {"Facebook", "Threads", "X", "LinkedIn"}:
+            if provider not in {"Facebook", "Threads", "X", "LinkedIn", "Discord"}:
                 self._json({"error": "Unsupported social OAuth provider."}, HTTPStatus.NOT_FOUND); return
             try:
                 session, settings = self._session(), social_oauth_settings(provider)

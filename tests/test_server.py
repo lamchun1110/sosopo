@@ -56,6 +56,20 @@ class SosopoTest(unittest.TestCase):
         self.assertEqual(captured["url"], "https://discord.com/api/webhooks/123/secret?wait=true")
         self.assertEqual(captured["payload"], {"content": "hello", "embeds": [], "allowed_mentions": {"parse": []}})
 
+    def test_discord_oauth_connection_stores_a_webhook_secret(self) -> None:
+        s = self.server
+        original_request_form = s.request_form
+        os.environ["SOSOPO_PUBLIC_URL"] = "https://sosopo.example.test"
+        s.request_form = lambda url, payload, headers=None: {"access_token": "oauth-token", "webhook": {"id": "123", "token": "webhook-secret", "channel_id": "456", "name": "Announcements"}}
+        try:
+            records = s.social_oauth_connections("Discord", {"client_id": "client", "client_secret": "secret", "token": "https://discord.example/token"}, "code", None)
+        finally:
+            s.request_form = original_request_form
+            os.environ.pop("SOSOPO_PUBLIC_URL", None)
+        self.assertEqual(records[0]["external_account_id"], "123")
+        self.assertEqual(records[0]["secret_name"], "webhook_url")
+        self.assertEqual(records[0]["access_token"], "https://discord.com/api/webhooks/123/webhook-secret")
+
     def test_multi_account_worker_marks_each_target_published(self) -> None:
         s = self.server
         with s.db() as connection:
