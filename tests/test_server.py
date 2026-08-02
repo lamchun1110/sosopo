@@ -1,0 +1,332 @@
+"""Focused regression tests for Sosopo's safety-critical local behavior."""
+
+from __future__ import annotations
+
+import importlib
+import os
+import shutil
+import tempfile
+import unittest
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import jwt
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+
+class SosopoTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp(prefix="sosopo-test-"))
+        os.environ["SOSOPO_DATA_DIR"] = str(self.directory)
+        os.environ["SOSOPO_ENCRYPTION_KEY"] = "Gd0EwA9sy_00SUdECwYyWEnyx3axpfAP7jSEWo2-YIE="
+        import app.server as imported_server
+        self.server = importlib.reload(imported_server)
+        self.server.setup_database()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.directory, ignore_errors=True)
+        os.environ.pop("SOSOPO_DATA_DIR", None)
+        os.environ.pop("SOSOPO_ENCRYPTION_KEY", None)
+
+    def test_timezone_conversion_and_past_schedule_rejection(self) -> None:
+        scheduled = self.server.Handler._schedule_time("2030-01-01T09:30", "Asia/Hong_Kong")
+        self.assertEqual(scheduled, "2030-01-01T01:30:00+00:00")
+        with self.assertRaises(ValueError):
+            self.server.Handler._schedule_time("2020-01-01T09:30", "UTC")
+
+    def test_multi_account_worker_marks_each_target_published(self) -> None:
+        s = self.server
+        with s.db() as connection:
+            user_id = s.insert_id(connection, "INSERT INTO users (username, password_salt, password_hash, role, timezone, created_at) VALUES (?, ?, ?, ?, ?, ?)", ("owner", "salt", "hash", "user", "UTC", s.now()))
+            post_id = s.insert_id(connection, "INSERT INTO posts (user_id, body, channel, state, scheduled_for, created_at) VALUES (?, ?, ?, 'publishing', ?, ?)", (user_id, "hello", "Telegram", s.now(), s.now()))
+            for account_id in ("-100001", "-100002"):
+                connection_id = s.insert_id(connection, "INSERT INTO connections (user_id, provider, external_account_id, display_name, encrypted_secrets, settings_json, created_at) VALUES (?, ?, ?, ?, ?, '{}', ?)", (user_id, "Telegram", account_id, account_id, s.encrypt_secrets({"bot_token": "test"}), s.now()))
+                connection.execute("INSERT INTO post_targets (post_id, connection_id) VALUES (?, ?)", (post_id, connection_id))
+        delivered: list[str] = []
+        original_publish = s.publish
+        s.publish = lambda post, account=None: delivered.append(account["external_account_id"]) or f"remote-{account['external_account_id']}"
+        try:
+            s.deliver(post_id)
+        finally:
+            s.publish = original_publish
+        with s.db() as connection:
+            post = connection.execute("SELECT state FROM posts WHERE id = ?", (post_id,)).fetchone()
+            targets = connection.execute("SELECT state FROM post_targets WHERE post_id = ?", (post_id,)).fetchall()
+        self.assertEqual(post["state"], "published")
+        self.assertEqual({target["state"] for target in targets}, {"published"})
+        self.assertEqual(set(delivered), {"-100001", "-100002"})
+
+    def test_claim_is_atomic(self) -> None:
+        s = self.server
+        with s.db() as connection:
+            post_id = s.insert_id(connection, "INSERT INTO posts (body, channel, state, scheduled_for, created_at) VALUES (?, ?, 'scheduled', ?, ?)", ("hello", "X", (datetime.now(UTC) - timedelta(minutes=1)).isoformat(), s.now()))
+        self.assertTrue(s.claim_post(post_id))
+        self.assertFalse(s.claim_post(post_id))
+
+    def test_audit_event_is_persisted_without_secrets(self) -> None:
+        s = self.server
+        s.audit(7, "connection.created", "connection", 11, "Created Telegram connection", "127.0.0.1")
+        with s.db() as connection:
+            event = connection.execute("SELECT user_id, action, subject_id, detail FROM audit_events").fetchone()
+        self.assertEqual(dict(event), {"user_id": 7, "action": "connection.created", "subject_id": "11", "detail": "Created Telegram connection"})
+
+    def test_inactive_user_session_is_rejected(self) -> None:
+        s = self.server
+        with s.db() as connection:
+            user_id = s.insert_id(connection, "INSERT INTO users (username, password_salt, password_hash, role, is_active, timezone, created_at) VALUES (?, ?, ?, ?, 0, ?, ?)", ("disabled", "salt", "hash", "user", "UTC", s.now()))
+            connection.execute("INSERT INTO sessions (token_hash, csrf_token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?)", ("token", "csrf", user_id, s.expires_at(), s.now()))
+            session = connection.execute("SELECT sessions.* FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.user_id = ? AND users.is_active = 1", (user_id,)).fetchone()
+        self.assertIsNone(session)
+
+    def test_failed_delivery_is_rescheduled_with_backoff(self) -> None:
+        s = self.server
+        with s.db() as connection:
+            post_id = s.insert_id(connection, "INSERT INTO posts (body, channel, state, attempts, scheduled_for, created_at) VALUES (?, ?, 'publishing', 1, ?, ?)", ("hello", "Telegram", s.now(), s.now()))
+        original_publish = s.publish
+        s.publish = lambda post, account=None: (_ for _ in ()).throw(s.ProviderError("temporary provider failure"))
+        try:
+            s.deliver(post_id)
+        finally:
+            s.publish = original_publish
+        with s.db() as connection:
+            post = connection.execute("SELECT state, scheduled_for, last_error FROM posts WHERE id = ?", (post_id,)).fetchone()
+        self.assertEqual(post["state"], "scheduled")
+        self.assertGreater(datetime.fromisoformat(post["scheduled_for"]), datetime.now(UTC) + timedelta(seconds=20))
+        self.assertIn("temporary provider failure", post["last_error"])
+
+    def test_worker_heartbeat_is_observable(self) -> None:
+        s = self.server
+        self.assertFalse(s.worker_healthy())
+        s.worker_heartbeat()
+        self.assertTrue(s.worker_healthy())
+
+    def test_file_backed_secret_configuration(self) -> None:
+        secret = self.directory / "secret"
+        secret.write_text("from-file\n", encoding="utf-8")
+        os.environ["TEST_VALUE"] = "from-environment"
+        os.environ["TEST_VALUE_FILE"] = str(secret)
+        try:
+            self.assertEqual(self.server.environment_value("TEST_VALUE"), "from-file")
+        finally:
+            os.environ.pop("TEST_VALUE", None)
+            os.environ.pop("TEST_VALUE_FILE", None)
+
+    def test_cleanup_removes_expired_session_and_oidc_state(self) -> None:
+        s = self.server
+        expired = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+        with s.db() as connection:
+            user_id = s.insert_id(connection, "INSERT INTO users (username, password_salt, password_hash, role, timezone, created_at) VALUES (?, ?, ?, ?, ?, ?)", ("expired", "salt", "hash", "user", "UTC", s.now()))
+            connection.execute("INSERT INTO sessions (token_hash, csrf_token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?)", ("expired-token", "csrf", user_id, expired, s.now()))
+            connection.execute("INSERT INTO oidc_states (state, nonce, code_verifier, expires_at) VALUES (?, ?, ?, ?)", ("expired-state", "nonce", "verifier", expired))
+        s.cleanup_expired_records()
+        with s.db() as connection:
+            self.assertIsNone(connection.execute("SELECT 1 FROM sessions WHERE token_hash = 'expired-token'").fetchone())
+            self.assertIsNone(connection.execute("SELECT 1 FROM oidc_states WHERE state = 'expired-state'").fetchone())
+
+    def test_image_signature_detection_rejects_mismatches(self) -> None:
+        s = self.server
+        self.assertEqual(s.detected_image_type(b"\x89PNG\r\n\x1a\nrest"), "image/png")
+        self.assertEqual(s.detected_image_type(b"GIF89arest"), "image/gif")
+        self.assertEqual(s.detected_image_type(b"\xff\xd8\xff\xe0rest"), "image/jpeg")
+        self.assertEqual(s.detected_image_type(b"RIFFxxxxWEBPrest"), "image/webp")
+        self.assertIsNone(s.detected_image_type(b"<script>alert(1)</script>"))
+
+    def test_disabled_connection_never_calls_provider(self) -> None:
+        s = self.server
+        with s.db() as connection:
+            user_id = s.insert_id(connection, "INSERT INTO users (username, password_salt, password_hash, role, timezone, created_at) VALUES (?, ?, ?, ?, ?, ?)", ("connection-owner", "salt", "hash", "user", "UTC", s.now()))
+            post_id = s.insert_id(connection, "INSERT INTO posts (user_id, body, channel, state, scheduled_for, created_at) VALUES (?, ?, ?, 'publishing', ?, ?)", (user_id, "hello", "Telegram", s.now(), s.now()))
+            connection_id = s.insert_id(connection, "INSERT INTO connections (user_id, provider, external_account_id, display_name, encrypted_secrets, settings_json, is_active, created_at) VALUES (?, ?, ?, ?, ?, '{}', 0, ?)", (user_id, "Telegram", "-100", "disabled", s.encrypt_secrets({"bot_token": "test"}), s.now()))
+            connection.execute("INSERT INTO post_targets (post_id, connection_id) VALUES (?, ?)", (post_id, connection_id))
+        original_publish = s.publish
+        s.publish = lambda post, account=None: self.fail("disabled account must not publish")
+        try:
+            s.deliver(post_id)
+        finally:
+            s.publish = original_publish
+        with s.db() as connection:
+            post = connection.execute("SELECT state, last_error FROM posts WHERE id = ?", (post_id,)).fetchone()
+        self.assertEqual(post["state"], "scheduled")
+        self.assertIn("disabled", post["last_error"])
+
+    def test_claim_records_publishing_lease(self) -> None:
+        s = self.server
+        with s.db() as connection:
+            post_id = s.insert_id(connection, "INSERT INTO posts (body, channel, state, scheduled_for, created_at) VALUES (?, ?, 'scheduled', ?, ?)", ("hello", "X", s.now(), s.now()))
+        self.assertTrue(s.claim_post(post_id))
+        with s.db() as connection:
+            post = connection.execute("SELECT state, publishing_started_at, attempts FROM posts WHERE id = ?", (post_id,)).fetchone()
+        self.assertEqual(post["state"], "publishing")
+        self.assertIsNotNone(post["publishing_started_at"])
+        self.assertEqual(post["attempts"], 1)
+
+    def test_stale_publishing_lease_is_recovered(self) -> None:
+        s = self.server
+        stale = (datetime.now(UTC) - timedelta(seconds=s.PUBLISHING_LEASE_SECONDS + 1)).isoformat()
+        with s.db() as connection:
+            post_id = s.insert_id(connection, "INSERT INTO posts (body, channel, state, publishing_started_at, scheduled_for, created_at) VALUES (?, ?, 'publishing', ?, ?, ?)", ("hello", "X", stale, stale, s.now()))
+        self.assertEqual(s.recover_stale_deliveries(), 1)
+        with s.db() as connection:
+            post = connection.execute("SELECT state, publishing_started_at, last_error FROM posts WHERE id = ?", (post_id,)).fetchone()
+        self.assertEqual(post["state"], "scheduled")
+        self.assertIsNone(post["publishing_started_at"])
+        self.assertIn("lease expired", post["last_error"])
+
+    def test_expired_connection_token_is_rejected_before_publish(self) -> None:
+        s = self.server
+        expired_account = {"token_expires_at": (datetime.now(UTC) - timedelta(minutes=1)).isoformat(), "encrypted_secrets": s.encrypt_secrets({"access_token": "test"})}
+        with self.assertRaisesRegex(s.ProviderError, "token has expired"):
+            s.publish({"channel": "X", "body": "hello", "image_url": None}, expired_account)
+        self.assertTrue(s.token_is_expired(expired_account["token_expires_at"]))
+        self.assertFalse(s.token_is_expired((datetime.now(UTC) + timedelta(days=1)).isoformat()))
+
+    def test_production_preflight_detects_missing_configuration(self) -> None:
+        import scripts.preflight as preflight
+        failures, _ = preflight.checks(True)
+        self.assertTrue(any("SOSOPO_PUBLIC_URL" in failure for failure in failures))
+
+    def test_password_hash_rotation_changes_verifier(self) -> None:
+        s = self.server
+        first_salt = b"a" * 16
+        second_salt = b"b" * 16
+        old_hash = s.hash_password("old-password-123", first_salt)
+        new_hash = s.hash_password("new-password-123", second_salt)
+        self.assertNotEqual(old_hash, new_hash)
+        self.assertTrue(__import__("secrets").compare_digest(s.hash_password("new-password-123", second_salt), new_hash))
+
+    def test_backup_secret_file_value(self) -> None:
+        import scripts.backup as backup
+        secret = self.directory / "backup-secret"
+        secret.write_text("secret-from-file\n", encoding="utf-8")
+        os.environ["BACKUP_TEST_VALUE_FILE"] = str(secret)
+        try:
+            self.assertEqual(backup.environment_value("BACKUP_TEST_VALUE"), "secret-from-file")
+        finally:
+            os.environ.pop("BACKUP_TEST_VALUE_FILE", None)
+
+    def test_invalid_fernet_key_has_safe_provider_error(self) -> None:
+        s = self.server
+        original = os.environ["SOSOPO_ENCRYPTION_KEY"]
+        os.environ["SOSOPO_ENCRYPTION_KEY"] = "invalid"
+        try:
+            with self.assertRaisesRegex(s.ProviderError, "valid Fernet key"):
+                s.encrypt_secrets({"access_token": "secret"})
+        finally:
+            os.environ["SOSOPO_ENCRYPTION_KEY"] = original
+
+    def test_delivery_history_query_is_scoped_by_post(self) -> None:
+        s = self.server
+        with s.db() as connection:
+            first = s.insert_id(connection, "INSERT INTO posts (body, channel, state, created_at) VALUES (?, ?, ?, ?)", ("first", "X", "published", s.now()))
+            second = s.insert_id(connection, "INSERT INTO posts (body, channel, state, created_at) VALUES (?, ?, ?, ?)", ("second", "X", "published", s.now()))
+            connection.execute("INSERT INTO deliveries (post_id, provider, status, detail, created_at) VALUES (?, ?, ?, ?, ?)", (first, "X", "published", "first-id", s.now()))
+            connection.execute("INSERT INTO deliveries (post_id, provider, status, detail, created_at) VALUES (?, ?, ?, ?, ?)", (second, "X", "failed", "second-error", s.now()))
+            records = connection.execute("SELECT detail FROM deliveries WHERE post_id = ? ORDER BY id DESC", (first,)).fetchall()
+        self.assertEqual([record["detail"] for record in records], ["first-id"])
+
+    def test_connection_secret_rotation_merges_without_exposing_secret(self) -> None:
+        s = self.server
+        original = s.encrypt_secrets({"access_token": "old", "other": "kept"})
+        rotated = s.encrypt_secrets({**s.decrypt_secrets(original), "access_token": "new"})
+        self.assertEqual(s.decrypt_secrets(rotated), {"access_token": "new", "other": "kept"})
+        self.assertNotIn("old", rotated)
+
+    def test_provider_specific_post_validation(self) -> None:
+        s = self.server
+        with self.assertRaisesRegex(ValueError, "Instagram publishing requires"):
+            s.validate_post("Instagram", "caption", None)
+        with self.assertRaisesRegex(ValueError, "Threads posts must be 500"):
+            s.validate_post("Threads", "x" * 501, None)
+        s.validate_post("Instagram", "caption", "/uploads/photo.jpg")
+        s.validate_post("Telegram", "x" * 4096, None)
+
+    def test_initial_setup_marker_is_unique(self) -> None:
+        s = self.server
+        with s.db() as connection:
+            connection.execute("INSERT INTO instance_settings (name, value) VALUES ('initial_setup', ?)", (s.now(),))
+        with self.assertRaises(Exception):
+            with s.db() as connection:
+                connection.execute("INSERT INTO instance_settings (name, value) VALUES ('initial_setup', ?)", (s.now(),))
+
+    def test_restore_rejects_unsafe_archive_members(self) -> None:
+        import io
+        import tarfile
+        import scripts.restore as restore
+        archive = self.directory / "unsafe.tar.gz"
+        with tarfile.open(archive, "w:gz") as output:
+            member = tarfile.TarInfo("../escape")
+            member.size = 1
+            output.addfile(member, io.BytesIO(b"x"))
+        with self.assertRaisesRegex(SystemExit, "unsafe path"):
+            restore.extract(archive, self.directory / "extracted")
+
+    def test_restore_uploads_preserves_previous_media(self) -> None:
+        import scripts.restore as restore
+        root = self.directory / "archive"
+        (root / "uploads").mkdir(parents=True)
+        (root / "uploads" / "new.png").write_bytes(b"new")
+        data = self.directory / "restore-data"
+        (data / "uploads").mkdir(parents=True)
+        (data / "uploads" / "old.png").write_bytes(b"old")
+        restore.restore_uploads(root, data, "stamp")
+        self.assertEqual((data / "uploads" / "new.png").read_bytes(), b"new")
+        self.assertEqual((data / "uploads.before-restore-stamp" / "old.png").read_bytes(), b"old")
+
+    def test_forwarded_ip_requires_trusted_proxy(self) -> None:
+        s = self.server
+        self.assertEqual(s.source_ip("198.51.100.4", "203.0.113.9", "127.0.0.1/32"), "198.51.100.4")
+        self.assertEqual(s.source_ip("127.0.0.1", "203.0.113.9, 127.0.0.1", "127.0.0.1/32"), "203.0.113.9")
+        self.assertEqual(s.source_ip("127.0.0.1", "not-an-ip", "127.0.0.1/32"), "127.0.0.1")
+
+    def test_s3_media_url_requires_public_https_url(self) -> None:
+        s = self.server
+        previous = {key: os.environ.get(key) for key in ("SOSOPO_STORAGE_BACKEND", "SOSOPO_MEDIA_PUBLIC_URL", "S3_MEDIA_PREFIX")}
+        os.environ.update({"SOSOPO_STORAGE_BACKEND": "s3", "SOSOPO_MEDIA_PUBLIC_URL": "https://media.example.com", "S3_MEDIA_PREFIX": "uploads"})
+        try:
+            self.assertEqual(s.media_url("photo.png"), "https://media.example.com/uploads/photo.png")
+            self.assertEqual(s.public_image_url("https://media.example.com/uploads/photo.png"), "https://media.example.com/uploads/photo.png")
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_preflight_rejects_incomplete_s3_media_configuration(self) -> None:
+        import scripts.preflight as preflight
+        previous = {key: os.environ.get(key) for key in ("SOSOPO_STORAGE_BACKEND", "S3_MEDIA_BUCKET", "SOSOPO_MEDIA_PUBLIC_URL")}
+        os.environ["SOSOPO_STORAGE_BACKEND"] = "s3"
+        os.environ.pop("S3_MEDIA_BUCKET", None)
+        os.environ.pop("SOSOPO_MEDIA_PUBLIC_URL", None)
+        try:
+            failures, _ = preflight.checks(True)
+            self.assertTrue(any("S3_MEDIA_BUCKET" in failure for failure in failures))
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_oidc_token_requires_valid_signature_and_nonce(self) -> None:
+        s = self.server
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        claims = {"iss": "https://issuer.example", "aud": "client", "sub": "subject", "nonce": "expected", "iat": int(datetime.now(UTC).timestamp()), "exp": int((datetime.now(UTC) + timedelta(minutes=5)).timestamp())}
+        token = jwt.encode(claims, private_key, algorithm="RS256", headers={"kid": "test"})
+        class KeyClient:
+            def __init__(self, uri: str) -> None: pass
+            def get_signing_key_from_jwt(self, value: str):
+                return type("SigningKey", (), {"key": private_key.public_key()})()
+        original = s.PyJWKClient
+        s.PyJWKClient = KeyClient
+        settings = {"jwks_uri": "https://issuer.example/keys", "issuer": "https://issuer.example", "client_id": "client", "id_token_signing_alg_values_supported": ["RS256"]}
+        try:
+            self.assertEqual(s.verify_oidc_id_token(token, settings, "expected")["sub"], "subject")
+            with self.assertRaisesRegex(s.ProviderError, "nonce"):
+                s.verify_oidc_id_token(token, settings, "wrong")
+        finally:
+            s.PyJWKClient = original
+
+
+if __name__ == "__main__":
+    unittest.main()

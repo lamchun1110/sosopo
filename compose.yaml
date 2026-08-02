@@ -1,0 +1,162 @@
+name: sosopo
+
+services:
+  sosopo:
+    build: .
+    container_name: sosopo
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    ports:
+      # Keep the unauthenticated starter app reachable only from this host.
+      # Use a reverse proxy with authentication before exposing it publicly.
+      - "127.0.0.1:8088:8080"
+    environment:
+      SOSOPO_DATA_DIR: /data
+      DATABASE_URL: ${DATABASE_URL:-}
+      DATABASE_URL_FILE: ${DATABASE_URL_FILE:-}
+      SOSOPO_ENCRYPTION_KEY: ${SOSOPO_ENCRYPTION_KEY:-}
+      SOSOPO_ENCRYPTION_KEY_FILE: ${SOSOPO_ENCRYPTION_KEY_FILE:-}
+      SOSOPO_PUBLIC_URL: ${SOSOPO_PUBLIC_URL:-}
+      SOSOPO_STORAGE_BACKEND: ${SOSOPO_STORAGE_BACKEND:-local}
+      SOSOPO_MEDIA_PUBLIC_URL: ${SOSOPO_MEDIA_PUBLIC_URL:-}
+      S3_MEDIA_BUCKET: ${S3_MEDIA_BUCKET:-}
+      S3_MEDIA_PREFIX: ${S3_MEDIA_PREFIX:-uploads}
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_CLIENT_SECRET_FILE: ${OIDC_CLIENT_SECRET_FILE:-}
+      OIDC_ALLOW_SIGNUP: ${OIDC_ALLOW_SIGNUP:-false}
+      SOSOPO_AUDIT_RETENTION_DAYS: ${SOSOPO_AUDIT_RETENTION_DAYS:-365}
+      SOSOPO_TRUSTED_PROXY_CIDRS: ${SOSOPO_TRUSTED_PROXY_CIDRS:-}
+      BACKUP_DESTINATION: ${BACKUP_DESTINATION:-local}
+      BACKUP_LOCAL_DIR: ${BACKUP_LOCAL_DIR:-/backups}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_PREFIX: ${S3_PREFIX:-sosopo}
+      S3_SERVER_SIDE_ENCRYPTION: ${S3_SERVER_SIDE_ENCRYPTION:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_ACCESS_KEY_ID_FILE: ${AWS_ACCESS_KEY_ID_FILE:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SECRET_ACCESS_KEY_FILE: ${AWS_SECRET_ACCESS_KEY_FILE:-}
+      SOSOPO_PUBLIC_BASE_URL: ${SOSOPO_PUBLIC_BASE_URL:-}
+      META_GRAPH_BASE_URL: ${META_GRAPH_BASE_URL:-}
+      FACEBOOK_PAGE_ID: ${FACEBOOK_PAGE_ID:-}
+      FACEBOOK_PAGE_ACCESS_TOKEN: ${FACEBOOK_PAGE_ACCESS_TOKEN:-}
+      FACEBOOK_PAGE_ACCESS_TOKEN_FILE: ${FACEBOOK_PAGE_ACCESS_TOKEN_FILE:-}
+      INSTAGRAM_ACCOUNT_ID: ${INSTAGRAM_ACCOUNT_ID:-}
+      INSTAGRAM_ACCESS_TOKEN: ${INSTAGRAM_ACCESS_TOKEN:-}
+      INSTAGRAM_ACCESS_TOKEN_FILE: ${INSTAGRAM_ACCESS_TOKEN_FILE:-}
+      THREADS_API_BASE_URL: ${THREADS_API_BASE_URL:-}
+      THREADS_USER_ID: ${THREADS_USER_ID:-}
+      THREADS_ACCESS_TOKEN: ${THREADS_ACCESS_TOKEN:-}
+      THREADS_ACCESS_TOKEN_FILE: ${THREADS_ACCESS_TOKEN_FILE:-}
+      X_ACCESS_TOKEN: ${X_ACCESS_TOKEN:-}
+      X_ACCESS_TOKEN_FILE: ${X_ACCESS_TOKEN_FILE:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_BOT_TOKEN_FILE: ${TELEGRAM_BOT_TOKEN_FILE:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ./data:/data
+      - ./backups:/backups
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+  sosopo-worker:
+    build: .
+    command: ["python", "/app/app/worker.py"]
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    depends_on:
+      sosopo:
+        condition: service_healthy
+    environment:
+      SOSOPO_DATA_DIR: /data
+      DATABASE_URL: ${DATABASE_URL:-}
+      DATABASE_URL_FILE: ${DATABASE_URL_FILE:-}
+      SOSOPO_AUDIT_RETENTION_DAYS: ${SOSOPO_AUDIT_RETENTION_DAYS:-365}
+      SOSOPO_PUBLIC_URL: ${SOSOPO_PUBLIC_URL:-}
+      SOSOPO_STORAGE_BACKEND: ${SOSOPO_STORAGE_BACKEND:-local}
+      SOSOPO_MEDIA_PUBLIC_URL: ${SOSOPO_MEDIA_PUBLIC_URL:-}
+      S3_MEDIA_BUCKET: ${S3_MEDIA_BUCKET:-}
+      S3_MEDIA_PREFIX: ${S3_MEDIA_PREFIX:-uploads}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_ACCESS_KEY_ID_FILE: ${AWS_ACCESS_KEY_ID_FILE:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SECRET_ACCESS_KEY_FILE: ${AWS_SECRET_ACCESS_KEY_FILE:-}
+      SOSOPO_PUBLIC_BASE_URL: ${SOSOPO_PUBLIC_BASE_URL:-}
+      META_GRAPH_BASE_URL: ${META_GRAPH_BASE_URL:-}
+      FACEBOOK_PAGE_ID: ${FACEBOOK_PAGE_ID:-}
+      FACEBOOK_PAGE_ACCESS_TOKEN: ${FACEBOOK_PAGE_ACCESS_TOKEN:-}
+      FACEBOOK_PAGE_ACCESS_TOKEN_FILE: ${FACEBOOK_PAGE_ACCESS_TOKEN_FILE:-}
+      INSTAGRAM_ACCOUNT_ID: ${INSTAGRAM_ACCOUNT_ID:-}
+      INSTAGRAM_ACCESS_TOKEN: ${INSTAGRAM_ACCESS_TOKEN:-}
+      INSTAGRAM_ACCESS_TOKEN_FILE: ${INSTAGRAM_ACCESS_TOKEN_FILE:-}
+      THREADS_API_BASE_URL: ${THREADS_API_BASE_URL:-}
+      THREADS_USER_ID: ${THREADS_USER_ID:-}
+      THREADS_ACCESS_TOKEN: ${THREADS_ACCESS_TOKEN:-}
+      THREADS_ACCESS_TOKEN_FILE: ${THREADS_ACCESS_TOKEN_FILE:-}
+      X_ACCESS_TOKEN: ${X_ACCESS_TOKEN:-}
+      X_ACCESS_TOKEN_FILE: ${X_ACCESS_TOKEN_FILE:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_BOT_TOKEN_FILE: ${TELEGRAM_BOT_TOKEN_FILE:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.path.insert(0, '/app/app'); from server import worker_healthy; raise SystemExit(0 if worker_healthy() else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+  sosopo-backup:
+    build: .
+    command: ["sh", "-c", "while :; do python /app/scripts/backup.py; sleep $${BACKUP_INTERVAL_SECONDS:-86400}; done"]
+    restart: unless-stopped
+    profiles: ["backup"]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    depends_on:
+      sosopo:
+        condition: service_healthy
+    environment:
+      SOSOPO_DATA_DIR: /data
+      DATABASE_URL: ${DATABASE_URL:-}
+      DATABASE_URL_FILE: ${DATABASE_URL_FILE:-}
+      BACKUP_DESTINATION: ${BACKUP_DESTINATION:-local}
+      BACKUP_LOCAL_DIR: ${BACKUP_LOCAL_DIR:-/backups}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_PREFIX: ${S3_PREFIX:-sosopo}
+      S3_SERVER_SIDE_ENCRYPTION: ${S3_SERVER_SIDE_ENCRYPTION:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_ACCESS_KEY_ID_FILE: ${AWS_ACCESS_KEY_ID_FILE:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SECRET_ACCESS_KEY_FILE: ${AWS_SECRET_ACCESS_KEY_FILE:-}
+    volumes:
+      - ./data:/data:ro
+      - ./backups:/backups

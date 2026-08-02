@@ -1,0 +1,32 @@
+# Production-oriented PostgreSQL override. Keep this file with compose.yaml.
+# Copy .env.postgres.example to .env and replace every password before starting.
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:17@sha256:a426e44bac0b759c95894d68e1a0ac03ecc20b619f498a91aae373bf06d8508d}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sosopo}
+      POSTGRES_USER: ${POSTGRES_USER:-sosopo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+
+  sosopo:
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  sosopo-worker:
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
