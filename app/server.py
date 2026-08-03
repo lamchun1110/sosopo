@@ -2036,10 +2036,15 @@ class Handler(SimpleHTTPRequestHandler):
             with db() as connection:
                 states = {row["state"]: row["count"] for row in connection.execute("SELECT state, COUNT(*) AS count FROM posts GROUP BY state").fetchall()}
                 deliveries = {row["status"]: row["count"] for row in connection.execute("SELECT status, COUNT(*) AS count FROM deliveries GROUP BY status").fetchall()}
+                media = {row["status"]: row["count"] for row in connection.execute("SELECT status, COUNT(*) AS count FROM media_jobs GROUP BY status").fetchall()}
+                active_workspaces = connection.execute("SELECT COUNT(*) AS count FROM workspaces WHERE status = 'active'").fetchone()["count"]
             lines = ["# HELP sosopo_posts Number of posts by state.", "# TYPE sosopo_posts gauge"]
             lines.extend(f'sosopo_posts{{state="{state}"}} {count}' for state, count in sorted(states.items()))
             lines.extend(["# HELP sosopo_deliveries_total Delivery attempts by result.", "# TYPE sosopo_deliveries_total counter"])
             lines.extend(f'sosopo_deliveries_total{{status="{status}"}} {count}' for status, count in sorted(deliveries.items()))
+            lines.extend(["# HELP sosopo_media_jobs Number of AI media jobs by status.", "# TYPE sosopo_media_jobs gauge"])
+            lines.extend(f'sosopo_media_jobs{{status="{status}"}} {count}' for status, count in sorted(media.items()))
+            lines.extend(["# HELP sosopo_workspaces Number of active workspaces.", "# TYPE sosopo_workspaces gauge", f"sosopo_workspaces {active_workspaces}"])
             lines.extend(["# HELP sosopo_worker_healthy Worker heartbeat health (1 healthy, 0 unhealthy).", "# TYPE sosopo_worker_healthy gauge", f"sosopo_worker_healthy {int(worker_healthy())}"])
             body = ("\n".join(lines) + "\n").encode()
             self.send_response(HTTPStatus.OK)
@@ -2305,6 +2310,50 @@ class Handler(SimpleHTTPRequestHandler):
                     (workspace_id,),
                 ).fetchall()]
             self._json({"assets": assets})
+            return
+        if path == "/api/workspaces/status":
+            session = self._session()
+            workspace_id = self._require_workspace(session, "admin")
+            if workspace_id is None:
+                return
+            since = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+            with db() as connection:
+                posts = {row["state"]: row["count"] for row in connection.execute("SELECT state, COUNT(*) AS count FROM posts WHERE workspace_id = ? GROUP BY state", (workspace_id,)).fetchall()}
+                deliveries = [dict(row) for row in connection.execute(
+                    "SELECT deliveries.provider, deliveries.status, COUNT(*) AS count FROM deliveries JOIN posts ON posts.id = deliveries.post_id"
+                    " WHERE posts.workspace_id = ? AND deliveries.created_at >= ? GROUP BY deliveries.provider, deliveries.status",
+                    (workspace_id, since),
+                ).fetchall()]
+                accounts = [dict(row) for row in connection.execute("SELECT is_active, token_expires_at FROM connections WHERE workspace_id = ?", (workspace_id,)).fetchall()]
+                members = int(connection.execute("SELECT COUNT(*) AS count FROM workspace_memberships WHERE workspace_id = ?", (workspace_id,)).fetchone()["count"])
+                media_jobs = {row["status"]: row["count"] for row in connection.execute("SELECT status, COUNT(*) AS count FROM media_jobs WHERE workspace_id = ? GROUP BY status", (workspace_id,)).fetchall()}
+                plan = workspace_plan(connection, workspace_id)
+                usage = {
+                    "posts_created": usage_amount(connection, workspace_id, "posts_created"),
+                    "ai_generations": usage_amount(connection, workspace_id, "ai_generations"),
+                    "ai_media": usage_amount(connection, workspace_id, "ai_media"),
+                    "storage_bytes": usage_amount(connection, workspace_id, "storage_bytes", period="total"),
+                }
+                cap = workspace_setting(connection, workspace_id, "ai_monthly_cap")
+            health = {"active": 0, "expiring_soon": 0, "expired": 0, "disabled": 0}
+            for account in accounts:
+                health[connection_health(account)] += 1
+            self._json({"plan": plan, "limits": plan_limits(plan), "usage": usage, "ai_monthly_cap": int(cap) if cap is not None else None, "posts": posts, "deliveries_30d": deliveries, "connection_health": health, "members": members, "media_jobs": media_jobs, "period": current_period()})
+            return
+        if path == "/api/admin/workspaces":
+            session = self._session()
+            if session["role"] != "admin":
+                self._json({"error": "Administrator access required."}, HTTPStatus.FORBIDDEN); return
+            with db() as connection:
+                rows = [dict(row) for row in connection.execute(
+                    "SELECT workspaces.id, workspaces.name, workspaces.slug, workspaces.plan, workspaces.status, workspaces.created_at, users.username AS owner,"
+                    " (SELECT COUNT(*) FROM workspace_memberships WHERE workspace_memberships.workspace_id = workspaces.id) AS member_count,"
+                    " (SELECT COUNT(*) FROM posts WHERE posts.workspace_id = workspaces.id) AS post_count"
+                    " FROM workspaces JOIN users ON users.id = workspaces.owner_user_id ORDER BY workspaces.id",
+                ).fetchall()]
+            # Support access is deliberately metadata-only and always audited.
+            audit(session["user_id"], "admin.workspaces_listed", "instance", None, f"Listed {len(rows)} workspaces (support access)", self._source_ip())
+            self._json({"workspaces": rows})
             return
         if path == "/api/workspaces/export":
             session = self._session()
