@@ -76,7 +76,7 @@ Local disk (`SOSOPO_STORAGE_BACKEND=local`) is the default and stores uploads in
 
 Sosopo can generate draft post copy inside the composer. An administrator configures it in the dedicated **AI providers** tab in the left rail: choose OpenAI, OpenRouter, Kimi, MiniMax, or Z.AI GLM; paste the provider API key; and choose the default model from a dropdown. Credentials are encrypted at rest and never returned to the browser. Sosopo owns the provider endpoint presets, so administrators do not need to enter a base URL or model-list URL.
 
-Each provider starts with a maintained set of sensible text-model choices. After saving, use **Refresh model list** to load and save the provider's current catalog where its API supports discovery; the refreshed catalog becomes the dropdown list. The composer uses the first configured provider and its selected default model, so collaborators never need to manage provider credentials or model IDs.
+Each provider starts with a maintained set of sensible text-model choices. OpenAI includes the GPT-5.6 Sol/Terra/Luna and GPT-5.5 entries requested by the workspace; Kimi includes K3, K2.7 Code, and K2.6; MiniMax includes M3 and current M2 variants. After saving, use **Refresh model list** to load and save the provider's account-visible catalog. OpenRouter’s public catalog can be refreshed before saving a key. The composer uses the first configured provider and its selected default model, so collaborators never need to manage provider credentials or model IDs.
 
 Environment variables remain supported as an optional deployment/migration fallback, but users do not need to edit `.env` when the administrator configures providers in the UI.
 
@@ -101,6 +101,8 @@ OpenClaw’s OpenAI OAuth uses its bundled Codex runtime and a ChatGPT/Codex sub
 One owner can hold multiple Facebook Pages, Instagram accounts, Threads profiles, X accounts, Telegram channels, Discord webhooks, or LinkedIn authors. Connection secrets are encrypted with Fernet before being written to the database and are never returned by the API. The composer can select several platforms and one or more connected accounts per platform in a single post. Delivery is independently recorded for each account, so a failure on one destination can be retried without reposting to accounts that already succeeded. A single-platform post may still use legacy environment credentials when no connected account is selected.
 
 Posts can include up to 10 images, with provider-specific limits checked before saving (X accepts up to 4). Sosopo stores the attachments in their selected order and sends provider carousel/media-group requests where supported. Images are decoded and validated on upload. Use public HTTPS media storage because providers must be able to fetch scheduled attachments.
+
+Use **Remove** in the content queue to permanently remove an unpublished draft, scheduled item, or failed item. It cannot interrupt a post already being delivered. For published posts, **Delete from channels** uses each recorded connection and remote post ID to delete the delivered item from Facebook, Instagram, Threads, X, Telegram, Discord, and LinkedIn. Sosopo reports success or failure per channel; a partial failure leaves the remaining published records intact so it can be investigated or retried safely.
 
 The publish timezone is an IANA timezone dropdown populated by the browser (for example `Asia/Hong_Kong`). Sosopo converts the chosen local date/time to UTC and stores the selected timezone with the post.
 

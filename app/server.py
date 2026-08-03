@@ -24,7 +24,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -441,9 +441,9 @@ AI_PROVIDERS = {
 # Provider-owned defaults keep endpoint details out of the administrator UI.
 # A refreshed provider catalog supersedes these choices when available.
 AI_PROVIDER_MODELS = {
-    "OpenAI": ["gpt-5.2", "gpt-5.2-mini", "gpt-4.1-mini"],
-    "OpenRouter": ["openai/gpt-5.2", "anthropic/claude-sonnet-4.6", "moonshotai/kimi-k2.5"],
-    "Kimi": ["kimi-k2.5", "kimi-k2-turbo"],
+    "OpenAI": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.2"],
+    "OpenRouter": ["openai/gpt-5.6-sol", "openai/gpt-5.5", "anthropic/claude-sonnet-4.6"],
+    "Kimi": ["kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6"],
     "MiniMax": ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed", "M2-her"],
     "Z.AI GLM": ["glm-5.2", "glm-5.1", "glm-5"],
 }
@@ -510,12 +510,19 @@ def available_ai_providers() -> list[dict]:
 
 def ai_provider_models(provider: str) -> list[str]:
     """Refresh the provider's model catalog using its configured discovery endpoint."""
-    settings = ai_provider_settings(provider)
     stored = stored_ai_provider_settings(provider)
+    # OpenRouter publishes its complete catalog without authentication, so make
+    # it available in the selector before an administrator has saved a key.
+    if provider == "OpenRouter":
+        definition = AI_PROVIDERS[provider]
+        settings = {"name": provider, "api_key": stored.get("api_key") or config(f"{definition[1]}_API_KEY"), "base_url": definition[2]}
+    else:
+        settings = ai_provider_settings(provider)
     # A unique query string bypasses intermediary caches while keeping the
     # provider's documented models endpoint. Sosopo itself never caches this.
     model_list_url = f"{settings['base_url']}/models?refresh={int(time.time())}"
-    result = request_get_json(model_list_url, {"Authorization": f"Bearer {settings['api_key']}"})
+    headers = {"Authorization": f"Bearer {settings['api_key']}"} if settings.get("api_key") else None
+    result = request_get_json(model_list_url, headers)
     entries = result.get("data") or result.get("models") or []
     if not isinstance(entries, list):
         raise ProviderError("The AI provider returned an invalid model list.")
@@ -899,6 +906,23 @@ def request_get_json(url: str, headers: dict[str, str] | None = None) -> dict[st
     return result
 
 
+def request_delete(url: str, headers: dict[str, str] | None = None) -> dict[str, Any]:
+    """Delete a remote resource and normalize providers that return no body."""
+    request = Request(url, method="DELETE", headers=headers or {})
+    try:
+        with urlopen(request, timeout=30) as response:
+            body = response.read() or b"{}"
+            result = json.loads(body)
+    except HTTPError as error:
+        body = error.read().decode(errors="replace")[:500]
+        retry_after = parse_retry_after(error.headers.get("Retry-After", ""))
+        retryable = error.code == HTTPStatus.TOO_MANY_REQUESTS or error.code >= HTTPStatus.INTERNAL_SERVER_ERROR
+        raise ProviderError(f"Provider rejected deletion ({error.code}): {body}", retryable=retryable, retry_after=retry_after) from error
+    except (URLError, json.JSONDecodeError) as error:
+        raise ProviderError(f"Provider deletion could not be completed: {error}", retryable=True) from error
+    return result if isinstance(result, dict) else {}
+
+
 def parse_retry_after(value: str) -> int | None:
     """Accept only bounded Retry-After delay seconds from a provider response."""
     try:
@@ -1060,6 +1084,45 @@ def publish(post: dict[str, Any], account: dict[str, Any] | None = None) -> str:
         result = request_form(f"{base}/{user_id}/threads_publish", {"access_token": token, "creation_id": creation_id})
         return str(result.get("id") or "")
     raise ProviderError("Unsupported provider.")
+
+
+def delete_published_content(post: dict[str, Any], external_id: str, account: dict[str, Any] | None = None) -> None:
+    """Delete one delivered item using the credential that originally published it."""
+    channel = str(account.get("provider") or post["channel"]) if account else post["channel"]
+    if not external_id:
+        raise ProviderError("This delivery has no remote post ID and cannot be deleted.", retryable=False)
+    secrets_for_account = decrypt_secrets(account["encrypted_secrets"]) if account else {}
+    account_id = str(account["external_account_id"]) if account else ""
+    def credential(name: str, environment: str) -> str:
+        return secrets_for_account.get(name, "") or config(environment)
+    if channel == "Discord":
+        webhook_url = credential("webhook_url", "DISCORD_WEBHOOK_URL")
+        request_delete(f"{webhook_url.rstrip('/')}/messages/{quote(external_id, safe='')}")
+        return
+    if channel == "Telegram":
+        token, chat_id = credential("bot_token", "TELEGRAM_BOT_TOKEN"), account_id or credential("chat_id", "TELEGRAM_CHAT_ID")
+        for message_id in external_id.split(","):
+            telegram_request(token, "deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+        return
+    if channel == "X":
+        token = credential("access_token", "X_ACCESS_TOKEN")
+        request_delete(f"https://api.x.com/2/tweets/{quote(external_id, safe='')}", {"Authorization": f"Bearer {token}"})
+        return
+    if channel == "LinkedIn":
+        token, version = credential("access_token", "LINKEDIN_ACCESS_TOKEN"), config("LINKEDIN_API_VERSION")
+        request_delete(f"https://api.linkedin.com/rest/posts/{quote(external_id, safe='')}", {"Authorization": f"Bearer {token}", "LinkedIn-Version": version, "X-Restli-Protocol-Version": "2.0.0"})
+        return
+    if channel in {"Facebook", "Instagram"}:
+        token = credential("access_token", "FACEBOOK_PAGE_ACCESS_TOKEN" if channel == "Facebook" else "INSTAGRAM_ACCESS_TOKEN")
+        base = config("META_GRAPH_BASE_URL") or "https://graph.facebook.com/v24.0"
+        request_delete(f"{base}/{quote(external_id, safe='')}?{urlencode({'access_token': token})}")
+        return
+    if channel == "Threads":
+        token = credential("access_token", "THREADS_ACCESS_TOKEN")
+        base = config("THREADS_API_BASE_URL") or "https://graph.threads.net/v1.0"
+        request_delete(f"{base}/{quote(external_id, safe='')}?{urlencode({'access_token': token})}")
+        return
+    raise ProviderError("This provider does not support deleting delivered content.", retryable=False)
 
 
 def provider_status(channel: str) -> str:
@@ -1722,6 +1785,48 @@ class Handler(SimpleHTTPRequestHandler):
                 row["media_urls"] = image_urls
                 audit(session["user_id"], "post.created", "post", post_id, f"Created {'/'.join(channels)} post", self._source_ip())
                 self._json(row, HTTPStatus.CREATED); return
+            if path.startswith("/api/posts/") and path.endswith("/remove"):
+                post_id = int(path.split("/")[3])
+                with db() as connection:
+                    post = connection.execute("SELECT state FROM posts WHERE id = ? AND user_id = ?", (post_id, session["user_id"])).fetchone()
+                    if post is None or post["state"] not in {"draft", "scheduled", "failed"}:
+                        self._json({"error": "Only your drafts, scheduled posts, or failed posts can be removed from the queue."}, HTTPStatus.CONFLICT); return
+                    connection.execute("DELETE FROM deliveries WHERE post_id = ?", (post_id,))
+                    connection.execute("DELETE FROM post_media WHERE post_id = ?", (post_id,))
+                    connection.execute("DELETE FROM post_targets WHERE post_id = ?", (post_id,))
+                    connection.execute("DELETE FROM posts WHERE id = ? AND user_id = ?", (post_id, session["user_id"]))
+                audit(session["user_id"], "post.removed", "post", post_id, "Removed unpublished post from queue", self._source_ip())
+                self._json({"status": "removed"}); return
+            if path.startswith("/api/posts/") and path.endswith("/delete-from-channels"):
+                post_id = int(path.split("/")[3])
+                with db() as connection:
+                    row = connection.execute("SELECT * FROM posts WHERE id = ? AND user_id = ? AND state = 'published'", (post_id, session["user_id"])).fetchone()
+                    targets = [dict(item) for item in connection.execute("SELECT post_targets.connection_id, post_targets.external_id, connections.* FROM post_targets JOIN connections ON connections.id = post_targets.connection_id WHERE post_targets.post_id = ? AND post_targets.state = 'published'", (post_id,)).fetchall()]
+                if row is None:
+                    self._json({"error": "Only one of your published posts can be deleted from channels."}, HTTPStatus.NOT_FOUND); return
+                post, deleted, failed = dict(row), [], []
+                # Legacy one-provider records do not have a connection target.
+                pending = targets or [{"connection_id": None, "external_id": post.get("external_id", "")}]
+                for target in pending:
+                    try:
+                        delete_published_content(post, str(target.get("external_id") or ""), target if target.get("connection_id") is not None else None)
+                        deleted.append(str(target.get("provider") or post["channel"]))
+                        if target.get("connection_id") is not None:
+                            with db() as connection:
+                                connection.execute("UPDATE post_targets SET state = 'deleted', last_error = NULL WHERE post_id = ? AND connection_id = ?", (post_id, target["connection_id"]))
+                    except ProviderError as error:
+                        failed.append({"provider": str(target.get("provider") or post["channel"]), "error": str(error)})
+                        if target.get("connection_id") is not None:
+                            with db() as connection:
+                                connection.execute("UPDATE post_targets SET last_error = ? WHERE post_id = ? AND connection_id = ?", (str(error)[:500], post_id, target["connection_id"]))
+                if deleted and not failed:
+                    with db() as connection:
+                        connection.execute("UPDATE posts SET state = 'deleted', last_error = NULL WHERE id = ?", (post_id,))
+                elif failed:
+                    with db() as connection:
+                        connection.execute("UPDATE posts SET last_error = ? WHERE id = ?", ("Some channels could not delete the post.", post_id))
+                audit(session["user_id"], "post.remote_delete", "post", post_id, f"Deleted from {len(deleted)} channel(s), failed on {len(failed)}", self._source_ip())
+                self._json({"deleted": deleted, "failed": failed}, HTTPStatus.OK if deleted else HTTPStatus.BAD_GATEWAY); return
             if path.startswith("/api/posts/") and path.endswith("/schedule"):
                 post_id, schedule_zone = int(path.split("/")[3]), timezone_name(payload.get("scheduled_timezone") or session["timezone"])
                 schedule = self._schedule_time(payload.get("scheduled_for", ""), schedule_zone)

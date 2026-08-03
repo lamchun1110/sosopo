@@ -56,6 +56,28 @@ class SosopoTest(unittest.TestCase):
         self.assertEqual(captured["url"], "https://discord.com/api/webhooks/123/secret?wait=true")
         self.assertEqual(captured["payload"], {"content": "hello", "embeds": [], "allowed_mentions": {"parse": []}})
 
+    def test_delivered_discord_post_uses_its_saved_webhook_for_deletion(self) -> None:
+        s = self.server
+        captured = []
+        original_request_delete = s.request_delete
+        s.request_delete = lambda url, headers=None: captured.append((url, headers)) or {}
+        try:
+            s.delete_published_content({"channel": "Discord"}, "message-id", {"provider": "Discord", "external_account_id": "123", "encrypted_secrets": s.encrypt_secrets({"webhook_url": "https://discord.com/api/webhooks/123/secret"})})
+        finally:
+            s.request_delete = original_request_delete
+        self.assertEqual(captured, [("https://discord.com/api/webhooks/123/secret/messages/message-id", None)])
+
+    def test_delivered_telegram_album_deletes_every_message(self) -> None:
+        s = self.server
+        calls = []
+        original_telegram_request = s.telegram_request
+        s.telegram_request = lambda token, method, fields, image=None: calls.append((token, method, fields)) or {"ok": True}
+        try:
+            s.delete_published_content({"channel": "Telegram"}, "10,11", {"provider": "Telegram", "external_account_id": "-1001", "encrypted_secrets": s.encrypt_secrets({"bot_token": "bot-token"})})
+        finally:
+            s.telegram_request = original_telegram_request
+        self.assertEqual(calls, [("bot-token", "deleteMessage", {"chat_id": "-1001", "message_id": "10"}), ("bot-token", "deleteMessage", {"chat_id": "-1001", "message_id": "11"})])
+
     def test_discord_oauth_connection_stores_a_webhook_secret(self) -> None:
         s = self.server
         original_request_form = s.request_form
