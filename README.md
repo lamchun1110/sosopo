@@ -13,6 +13,12 @@ For a Cloudflare Tunnel, Traefik, Caddy, or Nginx Proxy Manager deployment, rout
 ## What works today
 
 - Organize work in shared workspaces with `owner`, `admin`, `editor`, and `viewer` roles; posts and channel connections belong to the workspace, are shared with its members, and are isolated from every other workspace.
+- Invite members by email with expiring, hash-stored invitation links; optional self-service signup for hosted deployments.
+- Monitor connection health with token-expiry alerts; X, LinkedIn, and Threads tokens refresh automatically before they expire.
+- Meter usage against workspace plans in hosted mode (self-hosted stays unlimited), with Stripe Checkout upgrades and owner-set AI budget caps.
+- Configure AI providers per workspace (bring your own key) with the instance-wide configuration as fallback.
+- Generate AI images and videos in an asynchronous media studio with admin review before anything can be published.
+- Export a workspace's data as secret-free JSON, or delete a workspace safely.
 - Create drafts for Facebook, Instagram, Threads, X, Telegram, Discord, and LinkedIn.
 - Schedule a post in any IANA timezone (for example `Asia/Hong_Kong` or `Europe/London`); it is stored as UTC for reliable delivery.
 - Upload one byte-validated PNG, JPEG, GIF, or WebP image per post (maximum 5 MB).
@@ -354,9 +360,23 @@ Workspace roles are separate from the instance `admin`/`user` roles:
 | `admin` | Everything an editor can, plus connecting, rotating, and disabling channel accounts and managing workspace members. |
 | `owner` | Everything an admin can, plus granting or revoking the workspace `admin` role. The workspace creator is its owner and cannot be removed or demoted. |
 
-Workspace admins add existing local or SSO accounts by username in **Team → Workspace members**; instance administrators create those accounts in **Team → Instance accounts**. Channel connections belong to the workspace, so every authorized member can select them in the composer while the credentials stay encrypted server-side and are never returned to a browser. Posts record their author for audit history but are owned by the workspace.
+Workspace admins add existing local or SSO accounts by username in **Team → Workspace members**, or send email invitations with a role: invitation tokens are stored only as SHA-256 hashes, expire after 7 days, and can be revoked while pending. When SMTP (`SOSOPO_SMTP_HOST`, `SOSOPO_SMTP_PORT`, `SOSOPO_SMTP_USERNAME`, `SOSOPO_SMTP_PASSWORD`, `SOSOPO_SMTP_FROM`, optional `SOSOPO_SMTP_STARTTLS`) is not configured, the invite link is shown to the admin for manual sharing. Recipients accept at `/invite`, either by creating a local account or while signed in. Instance administrators can still create local accounts directly in **Team → Instance accounts** as a recovery route. Channel connections belong to the workspace, so every authorized member can select them in the composer while the credentials stay encrypted server-side and are never returned to a browser. Posts record their author for audit history but are owned by the workspace.
+
+Workspace admins can also export the workspace's posts, members, delivery history, and connection metadata (never secrets) as a JSON download, and the owner can delete a workspace: deletion disables its channel connections, unschedules queued posts, and drops it from every member's selector. The **Team → Workspace overview** panel shows the plan, member/usage counts against limits, channel health, and media-job states; the same data is served by `GET /api/workspaces/status`.
 
 Upgrading an existing installation is safe: on the first start after this upgrade, each existing user automatically receives an isolated personal workspace containing exactly the posts, connections, and audit history they already owned. Nothing is merged, so nothing becomes visible to another user. AI provider configuration deliberately remains instance-wide until Phase 4 of the roadmap. One provider account can currently be connected in only one workspace per connecting user; reconnecting the same account from a second workspace is rejected with a clear error.
+
+## Hosted mode, plans, and billing
+
+`SOSOPO_DEPLOYMENT_MODE` selects `self_hosted` (default) or `hosted`. Self-hosted workspaces use the unlimited `self_hosted` plan, so existing installations keep today's behavior. In hosted mode, new workspaces start on the `free` plan and can upgrade to `starter` or `pro`; per-plan limits cover members, connected accounts, monthly posts, AI text generations, AI media generations, and media storage, and can be overridden with a `SOSOPO_PLAN_LIMITS` JSON value. Every limit failure returns a clear message naming the limit. Self-service signup is on by default in hosted mode and off in self-hosted mode; override either with `SOSOPO_ALLOW_SELF_SIGNUP`.
+
+Billing uses Stripe in hosted mode: set `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_STARTER`, and `STRIPE_PRICE_PRO`, then point a Stripe webhook at `POST /api/billing/webhook`. Sosopo verifies the `Stripe-Signature` header (HMAC, 5-minute tolerance) before applying `checkout.session.completed` upgrades or `customer.subscription.deleted` downgrades. Workspace owners start an upgrade from **Team → Workspace administration**; the checkout happens entirely on Stripe, and card details never touch Sosopo. Owners can also set a monthly AI action cap that limits combined AI text and media generations regardless of plan.
+
+Workspace owners and admins can save their own AI provider API keys per workspace in the **AI providers** tab; workspace keys are encrypted, never returned to browsers, and override the instance-wide configuration for that workspace only. The instance-wide configuration remains as a platform-provided fallback whose usage is metered by the workspace's plan. Hosted operators should also complete each provider's app review before launch: Meta (Facebook/Instagram/Threads) requires app review, business verification, and a public data-deletion procedure — Sosopo's workspace export and deletion workflows plus account disablement satisfy the data-access and deletion parts; X and LinkedIn require approved developer applications with the scopes listed above.
+
+## AI media studio
+
+Editors generate images or videos in the **Media** tab: choose the type, aspect ratio, provider, optional model, prompt, and an optional brand-style hint. Jobs run asynchronously in the worker with visible status and progress; image generation uses the provider's OpenAI-compatible `images/generations` endpoint, and video generation uses the OpenAI-style asynchronous `/videos` flow (providers without a supported media model fail with a clear message). Every successful result waits in **pending review** until a workspace admin approves or rejects it; only approved, workspace-owned assets appear in the library, can be attached in the composer, or can be published. Generated assets are stored in the same local-disk or S3 media storage as uploads, count against storage limits, and each job consumes one AI-media credit that is refunded automatically if the job fails.
 
 ## Users and SSO
 
@@ -423,6 +443,22 @@ Sosopo converts this to UTC before persisting and delivering it. Update the sign
 | `/api/workspaces/members` | `GET`, `POST` | Workspace-admin member listing and add-by-username. |
 | `/api/workspaces/members/{id}/role` | `POST` | Change a member's workspace role (owner-guarded). |
 | `/api/workspaces/members/{id}/remove` | `POST` | Remove a member from the active workspace. |
+| `/api/workspaces/invitations` | `GET`, `POST` | Pending invitations and email invitation creation. |
+| `/api/workspaces/invitations/{id}/revoke` | `POST` | Revoke a pending invitation. |
+| `/api/invitations/{token}` | `GET` | Public invitation lookup for the acceptance page. |
+| `/api/invitations/{token}/accept` | `POST` | Accept an invitation (new local account or signed-in). |
+| `/api/signup` | `POST` | Self-service signup when enabled. |
+| `/api/workspaces/status` | `GET` | Workspace-admin usage, health, and analytics summary. |
+| `/api/workspaces/export` | `GET` | Secret-free JSON export of the active workspace. |
+| `/api/workspaces/delete` | `POST` | Owner-only soft deletion of the active workspace. |
+| `/api/workspaces/settings` | `POST` | Owner-set monthly AI budget cap. |
+| `/api/workspaces/ai-providers` | `GET`, `POST` | Workspace-level AI provider keys, models, and refresh. |
+| `/api/workspaces/billing/checkout` | `POST` | Owner-only Stripe Checkout for plan upgrades. |
+| `/api/billing/webhook` | `POST` | Signature-verified Stripe webhook (plan changes). |
+| `/api/media/jobs` | `GET`, `POST` | AI media job queueing and status/progress listing. |
+| `/api/media/jobs/{id}/review` | `POST` | Workspace-admin approval or rejection of a result. |
+| `/api/media/library` | `GET` | Approved, publishable generated assets. |
+| `/api/admin/workspaces` | `GET` | Audited, metadata-only instance-admin oversight. |
 | `/api/me/password` | `POST` | Rotate local password and revoke existing sessions. |
 | `/api/admin/users` | `GET`, `POST` | Administrator-only user management. |
 | `/api/admin/users/{id}/disable` | `POST` | Disable an account and revoke its sessions. |
