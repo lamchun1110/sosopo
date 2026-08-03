@@ -77,6 +77,9 @@ MAX_WORKSPACE_NAME_LENGTH = 80
 INVITATION_SECONDS = 7 * 24 * 60 * 60
 EXPIRED_INVITATION_RETENTION_DAYS = 30
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+CONNECTION_EXPIRY_WARNING_DAYS = 7
+TOKEN_REFRESH_INTERVAL_SECONDS = 15 * 60
+TOKEN_REFRESH_HORIZON_HOURS = 24
 LOGGER = logging.getLogger("sosopo")
 RATE_LIMITS: dict[tuple[str, str], list[float]] = {}
 RATE_LIMIT_LOCK = threading.Lock()
@@ -122,6 +125,22 @@ def inspect_image(content: bytes, declared_type: str) -> tuple[int, int]:
     if actual != declared_type or width < 1 or height < 1:
         raise ValueError("Image content does not match the declared media type.")
     return width, height
+
+
+def connection_health(record: dict[str, Any]) -> str:
+    """Summarize one connection as active, expiring_soon, expired, or disabled."""
+    if not record.get("is_active"):
+        return "disabled"
+    expiry = record.get("token_expires_at")
+    if not expiry:
+        return "active"
+    if token_is_expired(expiry):
+        return "expired"
+    try:
+        remaining = datetime.fromisoformat(str(expiry).replace("Z", "+00:00")) - datetime.now(UTC)
+    except ValueError:
+        return "expired"
+    return "expiring_soon" if remaining <= timedelta(days=CONNECTION_EXPIRY_WARNING_DAYS) else "active"
 
 
 def token_is_expired(value: object) -> bool:
@@ -964,13 +983,14 @@ def social_oauth_connections(provider: str, settings: dict[str, str], code: str,
         if not profile.get("id"):
             raise ProviderError("Threads did not return a profile.")
         return [{"provider": "Threads", "external_account_id": str(profile["id"]), "display_name": str(profile.get("username") or profile["id"]), "access_token": access_token, "token_expires_at": expiry or ""}]
+    refresh_token = str(token.get("refresh_token") or "")
     if provider == "LinkedIn":
         profile = request_get_json("https://api.linkedin.com/v2/userinfo", {"Authorization": f"Bearer {access_token}"})
         subject = str(profile.get("sub") or "")
         if not subject:
             raise ProviderError("LinkedIn did not return a member profile.")
         author = subject if subject.startswith("urn:li:") else f"urn:li:person:{subject}"
-        return [{"provider": "LinkedIn", "external_account_id": author, "display_name": str(profile.get("name") or profile.get("given_name") or subject), "access_token": access_token, "token_expires_at": expiry or ""}]
+        return [{"provider": "LinkedIn", "external_account_id": author, "display_name": str(profile.get("name") or profile.get("given_name") or subject), "access_token": access_token, "refresh_token": refresh_token, "token_expires_at": expiry or ""}]
     if provider == "Discord":
         webhook = token.get("webhook")
         if not isinstance(webhook, dict) or not webhook.get("id") or not webhook.get("token"):
@@ -980,7 +1000,7 @@ def social_oauth_connections(provider: str, settings: dict[str, str], code: str,
     profile = request_get_json("https://api.x.com/2/users/me", {"Authorization": f"Bearer {access_token}"}).get("data", {})
     if not isinstance(profile, dict) or not profile.get("id"):
         raise ProviderError("X did not return a user profile.")
-    return [{"provider": "X", "external_account_id": str(profile["id"]), "display_name": str(profile.get("username") or profile.get("name") or profile["id"]), "access_token": access_token, "token_expires_at": expiry or ""}]
+    return [{"provider": "X", "external_account_id": str(profile["id"]), "display_name": str(profile.get("username") or profile.get("name") or profile["id"]), "access_token": access_token, "refresh_token": refresh_token, "token_expires_at": expiry or ""}]
 
 
 def save_social_connections(user_id: int, workspace_id: int, records: list[dict[str, str]]) -> int:
@@ -990,7 +1010,10 @@ def save_social_connections(user_id: int, workspace_id: int, records: list[dict[
             raise ProviderError("You are no longer a member of the workspace this connection was started for.", retryable=False)
         for record in records:
             existing = connection.execute("SELECT id FROM connections WHERE workspace_id = ? AND provider = ? AND external_account_id = ?", (workspace_id, record["provider"], record["external_account_id"])).fetchone()
-            encrypted = encrypt_secrets({str(record.get("secret_name") or "access_token"): record["access_token"]})
+            secrets_map = {str(record.get("secret_name") or "access_token"): record["access_token"]}
+            if record.get("refresh_token"):
+                secrets_map["refresh_token"] = str(record["refresh_token"])
+            encrypted = encrypt_secrets(secrets_map)
             expiry = record["token_expires_at"] or None
             if existing:
                 connection.execute("UPDATE connections SET display_name = ?, encrypted_secrets = ?, token_expires_at = ?, is_active = 1 WHERE id = ?", (record["display_name"], encrypted, expiry, existing["id"]))
@@ -1001,6 +1024,51 @@ def save_social_connections(user_id: int, workspace_id: int, records: list[dict[
                 connection.execute("INSERT INTO connections (user_id, workspace_id, provider, external_account_id, display_name, encrypted_secrets, settings_json, token_expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?)", (user_id, workspace_id, record["provider"], record["external_account_id"], record["display_name"], encrypted, expiry, now()))
             saved += 1
     return saved
+
+
+def refresh_connection_token(record: dict[str, Any]) -> bool:
+    """Rotate one OAuth connection's token before it expires; True when rotated."""
+    provider = str(record["provider"])
+    try:
+        stored = decrypt_secrets(record["encrypted_secrets"])
+        if provider in {"X", "LinkedIn"}:
+            refresh_token = stored.get("refresh_token", "")
+            if not refresh_token:
+                return False
+            settings = social_oauth_settings(provider)
+            token = request_form(settings["token"], {"grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": settings["client_id"], "client_secret": settings["client_secret"]})
+        elif provider == "Threads":
+            access = stored.get("access_token", "")
+            if not access:
+                return False
+            refresh_url = config("THREADS_REFRESH_URL") or "https://graph.threads.net/refresh_access_token"
+            token = request_get_json(f"{refresh_url}?{urlencode({'grant_type': 'th_refresh_token', 'access_token': access})}")
+        else:
+            return False
+    except ProviderError:
+        LOGGER.warning("Could not refresh the %s token for connection %s", provider, record.get("id"))
+        return False
+    access_token = str(token.get("access_token") or "")
+    if not access_token:
+        return False
+    updated = {**stored, "access_token": access_token}
+    if token.get("refresh_token"):
+        updated["refresh_token"] = str(token["refresh_token"])
+    with db() as connection:
+        connection.execute("UPDATE connections SET encrypted_secrets = ?, token_expires_at = ? WHERE id = ?", (encrypt_secrets(updated), social_token_expiry(token), record["id"]))
+    audit(None, "connection.token_refreshed", "connection", record.get("id"), f"Automatically refreshed {provider} token", "worker", workspace_id=record.get("workspace_id"))
+    return True
+
+
+def refresh_expiring_connection_tokens() -> int:
+    """Proactively refresh active OAuth tokens that expire within the horizon."""
+    horizon = (datetime.now(UTC) + timedelta(hours=TOKEN_REFRESH_HORIZON_HOURS)).isoformat()
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT * FROM connections WHERE is_active = 1 AND token_expires_at IS NOT NULL AND token_expires_at <= ? AND provider IN ('X', 'LinkedIn', 'Threads')",
+            (horizon,),
+        ).fetchall()
+    return sum(1 for row in rows if refresh_connection_token(dict(row)))
 
 
 def verify_oidc_id_token(token: object, settings: dict[str, str], nonce: str) -> dict[str, Any]:
@@ -1420,11 +1488,17 @@ def deliver(post_id: int) -> None:
 
 
 def scheduler() -> None:
+    last_token_refresh = 0.0
     while True:
         try:
             worker_heartbeat()
             cleanup_expired_records()
             recover_stale_deliveries()
+            if time.monotonic() - last_token_refresh >= TOKEN_REFRESH_INTERVAL_SECONDS:
+                last_token_refresh = time.monotonic()
+                refreshed = refresh_expiring_connection_tokens()
+                if refreshed:
+                    LOGGER.info("Refreshed %s expiring provider token(s)", refreshed)
             with db() as connection:
                 rows = connection.execute("SELECT id FROM posts WHERE state = 'scheduled' AND scheduled_for <= ? ORDER BY scheduled_for LIMIT 10", (now(),)).fetchall()
             for row in rows:
@@ -1780,7 +1854,32 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             with db() as connection:
                 records = [dict(row) for row in connection.execute("SELECT id, provider, external_account_id, display_name, token_expires_at, is_active, created_at FROM connections WHERE workspace_id = ? ORDER BY provider, display_name", (workspace_id,)).fetchall()]
+            for record in records:
+                record["health"] = connection_health(record)
             self._json({"connections": records})
+            return
+        if path == "/api/workspaces/export":
+            session = self._session()
+            workspace_id = self._require_workspace(session, "admin")
+            if workspace_id is None:
+                return
+            with db() as connection:
+                workspace = dict(connection.execute("SELECT id, name, slug, plan, status, created_at FROM workspaces WHERE id = ?", (workspace_id,)).fetchone())
+                members = [dict(row) for row in connection.execute("SELECT users.username, workspace_memberships.role, workspace_memberships.invite_state, workspace_memberships.created_at FROM workspace_memberships JOIN users ON users.id = workspace_memberships.user_id WHERE workspace_memberships.workspace_id = ?", (workspace_id,)).fetchall()]
+                posts = [dict(row) for row in connection.execute("SELECT * FROM posts WHERE workspace_id = ? ORDER BY id", (workspace_id,)).fetchall()]
+                for post in posts:
+                    post["media_urls"] = [row["media_url"] for row in connection.execute("SELECT media_url FROM post_media WHERE post_id = ? ORDER BY position", (post["id"],)).fetchall()]
+                accounts = [dict(row) for row in connection.execute("SELECT id, provider, external_account_id, display_name, token_expires_at, is_active, created_at FROM connections WHERE workspace_id = ? ORDER BY id", (workspace_id,)).fetchall()]
+                deliveries = [dict(row) for row in connection.execute("SELECT deliveries.* FROM deliveries JOIN posts ON posts.id = deliveries.post_id WHERE posts.workspace_id = ? ORDER BY deliveries.id", (workspace_id,)).fetchall()]
+            audit(session["user_id"], "workspace.exported", "workspace", workspace_id, "Exported workspace data", self._source_ip(), workspace_id=workspace_id)
+            body = json.dumps({"exported_at": now(), "workspace": workspace, "members": members, "posts": posts, "connections": accounts, "deliveries": deliveries}, indent=2).encode()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Disposition", f"attachment; filename=\"sosopo-{workspace['slug']}-export.json\"")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
             return
         if path == "/api/workspaces":
             session = self._session()
@@ -2109,6 +2208,19 @@ class Handler(SimpleHTTPRequestHandler):
                     connection.execute("DELETE FROM workspace_memberships WHERE id = ?", (membership["id"],))
                 audit(session["user_id"], "workspace.member_removed", "user", member_user_id, "Removed workspace member", self._source_ip(), workspace_id=workspace_id)
                 self._json({"status": "removed"}); return
+            if path == "/api/workspaces/delete":
+                workspace_id = self._require_workspace(session, "owner")
+                if workspace_id is None:
+                    return
+                with db() as connection:
+                    if len(user_workspaces(connection, session["user_id"])) < 2:
+                        self._json({"error": "Create or join another workspace before deleting your only workspace."}, HTTPStatus.BAD_REQUEST); return
+                    connection.execute("UPDATE workspaces SET status = 'deleted', updated_at = ? WHERE id = ?", (now(), workspace_id))
+                    connection.execute("UPDATE connections SET is_active = 0 WHERE workspace_id = ?", (workspace_id,))
+                    # Stop the worker from delivering queued content for a deleted tenant.
+                    connection.execute("UPDATE posts SET state = 'draft', scheduled_for = NULL WHERE workspace_id = ? AND state = 'scheduled'", (workspace_id,))
+                audit(session["user_id"], "workspace.deleted", "workspace", workspace_id, "Soft-deleted workspace, disabled its connections, and unscheduled queued posts", self._source_ip(), workspace_id=workspace_id)
+                self._json({"status": "deleted"}); return
             if path == "/api/workspaces/invitations":
                 workspace_id = self._require_workspace(session, "admin")
                 if workspace_id is None:
