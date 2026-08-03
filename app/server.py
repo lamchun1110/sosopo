@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import hmac
 import ipaddress
 import io
 import json
@@ -80,6 +81,17 @@ EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 CONNECTION_EXPIRY_WARNING_DAYS = 7
 TOKEN_REFRESH_INTERVAL_SECONDS = 15 * 60
 TOKEN_REFRESH_HORIZON_HOURS = 24
+# Per-plan limits for hosted deployments. self_hosted is deliberately
+# unlimited so existing installations keep today's behavior. Override or add
+# plans with the SOSOPO_PLAN_LIMITS JSON environment value.
+PLAN_LIMITS: dict[str, dict[str, int] | None] = {
+    "self_hosted": None,
+    "free": {"members": 3, "connections": 3, "posts_per_month": 30, "ai_generations_per_month": 20, "ai_media_per_month": 5, "storage_mb": 200},
+    "starter": {"members": 10, "connections": 10, "posts_per_month": 300, "ai_generations_per_month": 300, "ai_media_per_month": 100, "storage_mb": 2_000},
+    "pro": {"members": 50, "connections": 50, "posts_per_month": 3_000, "ai_generations_per_month": 3_000, "ai_media_per_month": 1_000, "storage_mb": 20_000},
+}
+STRIPE_PLAN_PRICE_VARIABLES = {"starter": "STRIPE_PRICE_STARTER", "pro": "STRIPE_PRICE_PRO"}
+STRIPE_WEBHOOK_TOLERANCE_SECONDS = 300
 LOGGER = logging.getLogger("sosopo")
 RATE_LIMITS: dict[tuple[str, str], list[float]] = {}
 RATE_LIMIT_LOCK = threading.Lock()
@@ -482,11 +494,31 @@ def setup_database() -> None:
                 FOREIGN KEY(invited_by) REFERENCES users(id)
             )""" % id_column
         )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS usage_records (
+                workspace_id INTEGER NOT NULL,
+                metric TEXT NOT NULL,
+                period TEXT NOT NULL,
+                amount INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(workspace_id, metric, period)
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS workspace_settings (
+                workspace_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY(workspace_id, name)
+            )"""
+        )
         add_column(connection, "workspace_id", "INTEGER")
         add_table_column(connection, "connections", "workspace_id", "INTEGER")
         add_table_column(connection, "sessions", "active_workspace_id", "INTEGER")
         add_table_column(connection, "social_oauth_states", "workspace_id", "INTEGER")
         add_table_column(connection, "audit_events", "workspace_id", "INTEGER")
+        add_table_column(connection, "workspaces", "billing_customer_id", "TEXT")
+        add_table_column(connection, "workspaces", "billing_subscription_id", "TEXT")
         connection.execute("CREATE INDEX IF NOT EXISTS posts_workspace ON posts(workspace_id, state)")
         connection.execute("CREATE INDEX IF NOT EXISTS connections_workspace ON connections(workspace_id, provider)")
         connection.execute("CREATE INDEX IF NOT EXISTS workspace_memberships_user ON workspace_memberships(user_id)")
@@ -516,11 +548,12 @@ def workspace_slug(connection: Database, name: str) -> str:
     return slug
 
 
-def create_workspace(connection: Database, name: str, owner_user_id: int) -> int:
+def create_workspace(connection: Database, name: str, owner_user_id: int, plan: str | None = None) -> int:
+    plan = plan or ("free" if deployment_mode() == "hosted" else "self_hosted")
     workspace_id = insert_id(
         connection,
-        "INSERT INTO workspaces (name, slug, owner_user_id, plan, status, created_at, updated_at) VALUES (?, ?, ?, 'self_hosted', 'active', ?, ?)",
-        (name, workspace_slug(connection, name), owner_user_id, now(), now()),
+        "INSERT INTO workspaces (name, slug, owner_user_id, plan, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', ?, ?)",
+        (name, workspace_slug(connection, name), owner_user_id, plan, now(), now()),
     )
     connection.execute(
         "INSERT INTO workspace_memberships (workspace_id, user_id, role, invite_state, created_at, updated_at) VALUES (?, ?, 'owner', 'active', ?, ?)",
@@ -562,6 +595,171 @@ def ensure_personal_workspace(connection: Database, user_id: int, username: str)
     connection.execute("UPDATE connections SET workspace_id = ? WHERE user_id = ? AND workspace_id IS NULL", (workspace_id, user_id))
     connection.execute("UPDATE audit_events SET workspace_id = ? WHERE user_id = ? AND workspace_id IS NULL", (workspace_id, user_id))
     return workspace_id
+
+
+def plan_limits(plan: str) -> dict[str, int] | None:
+    """Resolve one plan's limits; None means unlimited."""
+    limits: dict[str, dict[str, int] | None] = dict(PLAN_LIMITS)
+    raw = config("SOSOPO_PLAN_LIMITS")
+    if raw:
+        try:
+            override = json.loads(raw)
+        except json.JSONDecodeError:
+            LOGGER.warning("SOSOPO_PLAN_LIMITS is not valid JSON and was ignored")
+            override = {}
+        if isinstance(override, dict):
+            for name, value in override.items():
+                if value is None or isinstance(value, dict):
+                    limits[str(name)] = value
+    return limits.get(plan)
+
+
+def current_period() -> str:
+    return datetime.now(UTC).strftime("%Y-%m")
+
+
+def record_usage(connection: Database, workspace_id: int, metric: str, amount: int = 1, period: str | None = None) -> None:
+    period = period or current_period()
+    updated = connection.execute(
+        "UPDATE usage_records SET amount = amount + ?, updated_at = ? WHERE workspace_id = ? AND metric = ? AND period = ?",
+        (amount, now(), workspace_id, metric, period),
+    )
+    if updated.rowcount == 0:
+        connection.execute(
+            "INSERT INTO usage_records (workspace_id, metric, period, amount, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (workspace_id, metric, period, amount, now()),
+        )
+
+
+def usage_amount(connection: Database, workspace_id: int, metric: str, period: str | None = None) -> int:
+    row = connection.execute(
+        "SELECT amount FROM usage_records WHERE workspace_id = ? AND metric = ? AND period = ?",
+        (workspace_id, metric, period or current_period()),
+    ).fetchone()
+    return int(row["amount"]) if row else 0
+
+
+def workspace_plan(connection: Database, workspace_id: int) -> str:
+    row = connection.execute("SELECT plan FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
+    return str(row["plan"]) if row else "self_hosted"
+
+
+def workspace_setting(connection: Database, workspace_id: int, name: str) -> str | None:
+    row = connection.execute("SELECT value FROM workspace_settings WHERE workspace_id = ? AND name = ?", (workspace_id, name)).fetchone()
+    return str(row["value"]) if row else None
+
+
+def save_workspace_setting(connection: Database, workspace_id: int, name: str, value: str | None) -> None:
+    connection.execute("DELETE FROM workspace_settings WHERE workspace_id = ? AND name = ?", (workspace_id, name))
+    if value is not None:
+        connection.execute("INSERT INTO workspace_settings (workspace_id, name, value) VALUES (?, ?, ?)", (workspace_id, name, value))
+
+
+def enforce_monthly_quota(connection: Database, workspace_id: int, metric: str, limit_name: str, label: str) -> None:
+    limits = plan_limits(workspace_plan(connection, workspace_id))
+    if limits is not None:
+        limit = limits.get(limit_name)
+        if limit is not None and usage_amount(connection, workspace_id, metric) >= int(limit):
+            raise ProviderError(f"This workspace reached its monthly limit of {limit} {label}. Upgrade the plan or wait for the next month.", retryable=False)
+    if metric.startswith("ai_"):
+        cap = workspace_setting(connection, workspace_id, "ai_monthly_cap")
+        if cap is not None:
+            spent = usage_amount(connection, workspace_id, "ai_generations") + usage_amount(connection, workspace_id, "ai_media")
+            if spent >= int(cap):
+                raise ProviderError(f"This workspace reached its monthly AI budget cap of {cap} actions. A workspace owner can raise the cap in Team settings.", retryable=False)
+
+
+def enforce_member_limit(connection: Database, workspace_id: int) -> None:
+    limits = plan_limits(workspace_plan(connection, workspace_id))
+    if limits is None or limits.get("members") is None:
+        return
+    count = int(connection.execute("SELECT COUNT(*) AS count FROM workspace_memberships WHERE workspace_id = ?", (workspace_id,)).fetchone()["count"])
+    if count >= int(limits["members"]):
+        raise ProviderError(f"This workspace plan allows {limits['members']} members. Upgrade the plan to add more.", retryable=False)
+
+
+def enforce_connection_limit(connection: Database, workspace_id: int) -> None:
+    limits = plan_limits(workspace_plan(connection, workspace_id))
+    if limits is None or limits.get("connections") is None:
+        return
+    count = int(connection.execute("SELECT COUNT(*) AS count FROM connections WHERE workspace_id = ? AND is_active = 1", (workspace_id,)).fetchone()["count"])
+    if count >= int(limits["connections"]):
+        raise ProviderError(f"This workspace plan allows {limits['connections']} connected accounts. Upgrade the plan to add more.", retryable=False)
+
+
+def enforce_storage_limit(connection: Database, workspace_id: int, additional_bytes: int) -> None:
+    limits = plan_limits(workspace_plan(connection, workspace_id))
+    if limits is None or limits.get("storage_mb") is None:
+        return
+    used = usage_amount(connection, workspace_id, "storage_bytes", period="total")
+    if used + additional_bytes > int(limits["storage_mb"]) * 1024 * 1024:
+        raise ProviderError(f"This workspace reached its {limits['storage_mb']} MB media storage limit. Upgrade the plan or remove media.", retryable=False)
+
+
+def billing_enabled() -> bool:
+    return deployment_mode() == "hosted" and bool(config("STRIPE_SECRET_KEY"))
+
+
+def stripe_request(path: str, payload: dict[str, str]) -> dict[str, Any]:
+    request = Request(
+        f"https://api.stripe.com/v1/{path}",
+        data=urlencode(payload).encode(),
+        method="POST",
+        headers={"Authorization": f"Bearer {config('STRIPE_SECRET_KEY')}", "Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            result = json.loads(response.read() or b"{}")
+    except HTTPError as error:
+        LOGGER.error("Stripe request failed with status %s", error.code)
+        raise ProviderError("The billing provider rejected the request. Check the billing configuration.", retryable=False) from error
+    except (URLError, json.JSONDecodeError) as error:
+        raise ProviderError("The billing provider could not be reached.") from error
+    if not isinstance(result, dict):
+        raise ProviderError("The billing provider returned an invalid response.")
+    return result
+
+
+def verify_stripe_signature(payload: bytes, header: str, secret: str) -> bool:
+    """Verify a Stripe-Signature header (t=timestamp,v1=hmac) within tolerance."""
+    timestamp, candidates = "", []
+    for item in header.split(","):
+        key, _, value = item.strip().partition("=")
+        if key == "t":
+            timestamp = value
+        elif key == "v1":
+            candidates.append(value)
+    try:
+        age = abs(datetime.now(UTC).timestamp() - int(timestamp))
+    except ValueError:
+        return False
+    if age > STRIPE_WEBHOOK_TOLERANCE_SECONDS or not candidates:
+        return False
+    expected = hmac.new(secret.encode(), f"{timestamp}.".encode() + payload, hashlib.sha256).hexdigest()
+    return any(hmac.compare_digest(expected, candidate) for candidate in candidates)
+
+
+def apply_billing_event(event: dict[str, Any]) -> None:
+    kind = str(event.get("type") or "")
+    data = event.get("data", {}).get("object", {}) if isinstance(event.get("data"), dict) else {}
+    if not isinstance(data, dict):
+        return
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    try:
+        workspace_id = int(metadata.get("workspace_id") or data.get("client_reference_id"))
+    except (TypeError, ValueError):
+        return
+    with db() as connection:
+        if kind == "checkout.session.completed":
+            plan = str(metadata.get("plan") or "")
+            if plan in STRIPE_PLAN_PRICE_VARIABLES:
+                connection.execute(
+                    "UPDATE workspaces SET plan = ?, billing_customer_id = ?, billing_subscription_id = ?, updated_at = ? WHERE id = ?",
+                    (plan, str(data.get("customer") or ""), str(data.get("subscription") or ""), now(), workspace_id),
+                )
+        elif kind == "customer.subscription.deleted":
+            connection.execute("UPDATE workspaces SET plan = 'free', billing_subscription_id = NULL, updated_at = ? WHERE id = ?", (now(), workspace_id))
+    audit(None, f"billing.{kind}"[:100], "workspace", workspace_id, "Applied verified billing event", "stripe-webhook", workspace_id=workspace_id)
 
 
 def deployment_mode() -> str:
@@ -676,34 +874,57 @@ AI_PROVIDER_MODELS = {
 }
 
 
-def stored_ai_provider_settings(provider: str) -> dict:
+def stored_ai_provider_settings(provider: str, workspace_id: int | None = None) -> dict:
     definition = AI_PROVIDERS.get(provider)
     if definition is None:
         raise ProviderError("Choose a supported AI provider.", retryable=False)
+    setting_name = f"ai_provider_{definition[0]}"
     with db() as connection:
-        row = connection.execute("SELECT value FROM instance_settings WHERE name = ?", (f"ai_provider_{definition[0]}",)).fetchone()
+        if workspace_id is None:
+            row = connection.execute("SELECT value FROM instance_settings WHERE name = ?", (setting_name,)).fetchone()
+        else:
+            row = connection.execute("SELECT value FROM workspace_settings WHERE workspace_id = ? AND name = ?", (workspace_id, setting_name)).fetchone()
     return decrypt_secrets(row["value"]) if row else {}
 
 
-def save_ai_provider_settings(provider: str, settings: dict) -> None:
+def effective_ai_provider_stored(provider: str, workspace_id: int | None) -> tuple[dict, str]:
+    """Prefer a workspace's own provider credential over the instance-wide one.
+
+    A workspace configuration only takes effect once it holds its own API key;
+    a cached model catalog alone must not shadow the instance credential.
+    """
+    if workspace_id is not None:
+        workspace_stored = stored_ai_provider_settings(provider, workspace_id)
+        if workspace_stored.get("api_key"):
+            return workspace_stored, "workspace"
+    return stored_ai_provider_settings(provider), "instance"
+
+
+def save_ai_provider_settings(provider: str, settings: dict, workspace_id: int | None = None) -> None:
     """Save a provider configuration and its locally cached, reviewed model catalog."""
     definition = AI_PROVIDERS[provider]
     setting_name = f"ai_provider_{definition[0]}"
     with db() as connection:
-        exists = connection.execute("SELECT 1 FROM instance_settings WHERE name = ?", (setting_name,)).fetchone()
-        if exists:
-            connection.execute("UPDATE instance_settings SET value = ? WHERE name = ?", (encrypt_secrets(settings), setting_name))
+        if workspace_id is None:
+            exists = connection.execute("SELECT 1 FROM instance_settings WHERE name = ?", (setting_name,)).fetchone()
+            if exists:
+                connection.execute("UPDATE instance_settings SET value = ? WHERE name = ?", (encrypt_secrets(settings), setting_name))
+            else:
+                connection.execute("INSERT INTO instance_settings (name, value) VALUES (?, ?)", (setting_name, encrypt_secrets(settings)))
         else:
-            connection.execute("INSERT INTO instance_settings (name, value) VALUES (?, ?)", (setting_name, encrypt_secrets(settings)))
+            save_workspace_setting(connection, workspace_id, setting_name, encrypt_secrets(settings))
 
 
-def remove_ai_provider_settings(provider: str) -> bool:
+def remove_ai_provider_settings(provider: str, workspace_id: int | None = None) -> bool:
     """Remove the UI-saved credential and local catalog for one provider."""
     definition = AI_PROVIDERS.get(provider)
     if definition is None:
         raise ProviderError("Choose a supported AI provider.", retryable=False)
+    setting_name = f"ai_provider_{definition[0]}"
     with db() as connection:
-        return connection.execute("DELETE FROM instance_settings WHERE name = ?", (f"ai_provider_{definition[0]}",)).rowcount == 1
+        if workspace_id is None:
+            return connection.execute("DELETE FROM instance_settings WHERE name = ?", (setting_name,)).rowcount == 1
+        return connection.execute("DELETE FROM workspace_settings WHERE workspace_id = ? AND name = ?", (workspace_id, setting_name)).rowcount == 1
 
 
 def ai_model_catalog(stored: dict) -> list[str]:
@@ -716,44 +937,44 @@ def ai_model_catalog(stored: dict) -> list[str]:
     return [model for model in raw if isinstance(model, str) and model] if isinstance(raw, list) else []
 
 
-def ai_provider_settings(provider: str) -> dict[str, str]:
+def ai_provider_settings(provider: str, workspace_id: int | None = None) -> dict[str, str]:
     """Return only a configured, OpenAI-compatible text-generation provider."""
     definition = AI_PROVIDERS.get(provider)
     if definition is None:
         raise ProviderError("Choose a supported AI provider.", retryable=False)
     _, prefix, default_base = definition
-    stored = stored_ai_provider_settings(provider)
-    api_key = stored.get("api_key") or config(f"{prefix}_API_KEY")
+    stored, source = effective_ai_provider_stored(provider, workspace_id)
+    api_key = stored.get("api_key") or ("" if source == "workspace" else config(f"{prefix}_API_KEY"))
     base_url = stored.get("base_url") or config(f"{prefix}_BASE_URL") or default_base
     model = stored.get("model") or config(f"{prefix}_MODEL") or AI_PROVIDER_MODELS[provider][0]
     if not api_key or not base_url.startswith("https://") or not model:
         raise ProviderError(f"{provider} AI is not configured by this Sosopo administrator.", retryable=False)
-    return {"name": provider, "api_key": api_key, "base_url": base_url.rstrip("/"), "model": model}
+    return {"name": provider, "api_key": api_key, "base_url": base_url.rstrip("/"), "model": model, "source": source}
 
 
-def available_ai_providers() -> list[dict]:
+def available_ai_providers(workspace_id: int | None = None) -> list[dict]:
     providers: list[dict] = []
     for name in AI_PROVIDERS:
         try:
-            settings = ai_provider_settings(name)
-            stored = stored_ai_provider_settings(name)
+            settings = ai_provider_settings(name, workspace_id)
+            stored, _ = effective_ai_provider_stored(name, workspace_id)
             models = ai_model_catalog(stored) or AI_PROVIDER_MODELS[name]
-            providers.append({"name": settings["name"], "model": settings["model"], "models": models})
+            providers.append({"name": settings["name"], "model": settings["model"], "models": models, "source": settings["source"]})
         except ProviderError:
             pass
     return providers
 
 
-def ai_provider_models(provider: str) -> list[str]:
-    """Refresh the provider's model catalog using its configured discovery endpoint."""
-    stored = stored_ai_provider_settings(provider)
+def ai_provider_models(provider: str, workspace_id: int | None = None) -> list[str]:
+    """Refresh one scope's model catalog using the provider's discovery endpoint."""
+    stored = stored_ai_provider_settings(provider, workspace_id)
     # OpenRouter publishes its complete catalog without authentication, so make
     # it available in the selector before an administrator has saved a key.
     if provider == "OpenRouter":
         definition = AI_PROVIDERS[provider]
         settings = {"name": provider, "api_key": stored.get("api_key") or config(f"{definition[1]}_API_KEY"), "base_url": definition[2]}
     else:
-        settings = ai_provider_settings(provider)
+        settings = ai_provider_settings(provider, workspace_id)
     # MiniMax documents this exact endpoint for Token Plan keys.  In
     # particular, do not append cache-busting query parameters: some MiniMax
     # API gateways reject an otherwise valid signed/bearer request when the
@@ -779,14 +1000,14 @@ def ai_provider_models(provider: str) -> list[str]:
     # Keep a known-good catalog locally. The composer uses this catalog rather than
     # contacting the provider on every page load, and rejects unknown model IDs.
     stored.update({"models": json.dumps(models), "models_checked_at": now()})
-    save_ai_provider_settings(provider, stored)
+    save_ai_provider_settings(provider, stored, workspace_id)
     return models
 
 
-def generate_post_copy(provider: str, model: str, instruction: str, draft: str, channels: list[str]) -> str:
-    settings = ai_provider_settings(provider)
+def generate_post_copy(provider: str, model: str, instruction: str, draft: str, channels: list[str], workspace_id: int | None = None) -> str:
+    settings = ai_provider_settings(provider, workspace_id)
     selected_model = model.strip() or settings["model"]
-    stored = stored_ai_provider_settings(provider)
+    stored, _ = effective_ai_provider_stored(provider, workspace_id)
     catalog = ai_model_catalog(stored)
     if catalog and selected_model not in catalog:
         raise ProviderError("Choose a model from the provider's refreshed model catalog.", retryable=False)
@@ -1021,6 +1242,7 @@ def save_social_connections(user_id: int, workspace_id: int, records: list[dict[
                 conflicting = connection.execute("SELECT id FROM connections WHERE user_id = ? AND provider = ? AND external_account_id = ?", (user_id, record["provider"], record["external_account_id"])).fetchone()
                 if conflicting:
                     raise ProviderError(f"The {record['provider']} account {record['display_name']} is already connected in another of your workspaces.", retryable=False)
+                enforce_connection_limit(connection, workspace_id)
                 connection.execute("INSERT INTO connections (user_id, workspace_id, provider, external_account_id, display_name, encrypted_secrets, settings_json, token_expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?)", (user_id, workspace_id, record["provider"], record["external_account_id"], record["display_name"], encrypted, expiry, now()))
             saved += 1
     return saved
@@ -1800,8 +2022,39 @@ class Handler(SimpleHTTPRequestHandler):
             self._json({"posts": posts, "providers": [{"name": channel, "status": provider_status(channel), "oauth_available": social_oauth_enabled(channel)} for channel in CHANNELS]})
             return
         if path == "/api/ai/providers":
-            self._session()
-            self._json({"providers": available_ai_providers()})
+            session = self._session()
+            self._json({"providers": available_ai_providers(session.get("workspace_id"))})
+            return
+        if path == "/api/workspaces/ai-providers":
+            session = self._session()
+            workspace_id = self._require_workspace(session, "admin")
+            if workspace_id is None:
+                return
+            providers = []
+            for name in AI_PROVIDERS:
+                stored = stored_ai_provider_settings(name, workspace_id)
+                catalog = ai_model_catalog(stored)
+                instance_available = True
+                try:
+                    ai_provider_settings(name)
+                except ProviderError:
+                    instance_available = False
+                providers.append({"name": name, "model": stored.get("model", AI_PROVIDER_MODELS[name][0]), "models": catalog or AI_PROVIDER_MODELS[name], "models_count": len(catalog), "models_checked_at": stored.get("models_checked_at"), "has_api_key": bool(stored.get("api_key")), "instance_fallback": instance_available})
+            self._json({"providers": providers}); return
+        if path.startswith("/api/workspaces/ai-providers/") and path.endswith("/models"):
+            session = self._session()
+            workspace_id = self._require_workspace(session, "admin")
+            if workspace_id is None:
+                return
+            provider = unquote(path.split("/")[4])
+            if provider not in AI_PROVIDERS:
+                self._json({"error": "Choose a supported AI provider."}, HTTPStatus.BAD_REQUEST); return
+            if provider != "OpenRouter" and not stored_ai_provider_settings(provider, workspace_id).get("api_key"):
+                self._json({"error": "Save this workspace's API key for the provider before refreshing its models."}, HTTPStatus.BAD_REQUEST); return
+            try:
+                self._json({"models": ai_provider_models(provider, workspace_id)})
+            except ProviderError as error:
+                self._json({"error": str(error)}, HTTPStatus.BAD_GATEWAY)
             return
         if path == "/api/admin/users":
             session = self._session()
@@ -1962,8 +2215,31 @@ class Handler(SimpleHTTPRequestHandler):
             return
         return super().do_HEAD()
 
+    def _handle_billing_webhook(self) -> None:
+        """Verify and apply a Stripe webhook using the raw request body."""
+        secret = config("STRIPE_WEBHOOK_SECRET")
+        size = int(self.headers.get("Content-Length", "0") or 0)
+        if not secret or size <= 0 or size > 1_000_000:
+            self._json({"error": "Billing webhooks are not configured."}, HTTPStatus.NOT_FOUND)
+            return
+        raw = self.rfile.read(size)
+        if not verify_stripe_signature(raw, self.headers.get("Stripe-Signature", ""), secret):
+            self._json({"error": "Invalid webhook signature."}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            self._json({"error": "Invalid webhook payload."}, HTTPStatus.BAD_REQUEST)
+            return
+        if isinstance(event, dict):
+            apply_billing_event(event)
+        self._json({"received": True})
+
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        if path == "/api/billing/webhook":
+            self._handle_billing_webhook()
+            return
         try:
             payload = self._read_json()
             if path == "/api/setup":
@@ -2027,6 +2303,7 @@ class Handler(SimpleHTTPRequestHandler):
                         user_id = create_local_user(connection, username, password)
                     workspace_id = int(invitation["workspace_id"])
                     if connection.execute("SELECT 1 FROM workspace_memberships WHERE workspace_id = ? AND user_id = ?", (workspace_id, user_id)).fetchone() is None:
+                        enforce_member_limit(connection, workspace_id)
                         connection.execute(
                             "INSERT INTO workspace_memberships (workspace_id, user_id, role, invite_state, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)",
                             (workspace_id, user_id, invitation["role"], now(), now()),
@@ -2098,10 +2375,14 @@ class Handler(SimpleHTTPRequestHandler):
                 channels = payload.get("channels", [])
                 if not isinstance(channels, list) or any(str(channel) not in CHANNELS for channel in channels):
                     self._json({"error": "Choose valid post platforms for AI generation."}, HTTPStatus.BAD_REQUEST); return
+                with db() as connection:
+                    enforce_monthly_quota(connection, workspace_id, "ai_generations", "ai_generations_per_month", "AI text generations")
                 try:
-                    copy = generate_post_copy(provider, model, instruction, draft, [str(channel) for channel in channels])
+                    copy = generate_post_copy(provider, model, instruction, draft, [str(channel) for channel in channels], workspace_id)
                 except ProviderError as error:
                     self._json({"error": str(error)}, HTTPStatus.BAD_GATEWAY); return
+                with db() as connection:
+                    record_usage(connection, workspace_id, "ai_generations")
                 audit(session["user_id"], "post.ai_generated", "user", session["user_id"], f"Generated post copy with {provider}", self._source_ip(), workspace_id=workspace_id)
                 self._json({"copy": copy}); return
             if path == "/api/me/timezone":
@@ -2167,6 +2448,7 @@ class Handler(SimpleHTTPRequestHandler):
                         self._json({"error": "No active user has that username. An administrator can create the account first."}, HTTPStatus.NOT_FOUND); return
                     if connection.execute("SELECT id FROM workspace_memberships WHERE workspace_id = ? AND user_id = ?", (workspace_id, user["id"])).fetchone():
                         self._json({"error": "That user is already a member of this workspace."}, HTTPStatus.CONFLICT); return
+                    enforce_member_limit(connection, workspace_id)
                     connection.execute("INSERT INTO workspace_memberships (workspace_id, user_id, role, invite_state, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)", (workspace_id, user["id"], member_role, now(), now()))
                 audit(session["user_id"], "workspace.member_added", "user", user["id"], f"Added {username} as workspace {member_role}", self._source_ip(), workspace_id=workspace_id)
                 self._json({"user_id": user["id"], "username": user["username"], "role": member_role}, HTTPStatus.CREATED); return
@@ -2208,6 +2490,79 @@ class Handler(SimpleHTTPRequestHandler):
                     connection.execute("DELETE FROM workspace_memberships WHERE id = ?", (membership["id"],))
                 audit(session["user_id"], "workspace.member_removed", "user", member_user_id, "Removed workspace member", self._source_ip(), workspace_id=workspace_id)
                 self._json({"status": "removed"}); return
+            if path == "/api/workspaces/ai-providers":
+                workspace_id = self._require_workspace(session, "admin")
+                if workspace_id is None:
+                    return
+                provider = str(payload.get("provider", "")).strip()
+                if provider not in AI_PROVIDERS:
+                    self._json({"error": "Choose a supported AI provider."}, HTTPStatus.BAD_REQUEST); return
+                current = stored_ai_provider_settings(provider, workspace_id)
+                model = str(payload.get("model", "")).strip() or current.get("model") or AI_PROVIDER_MODELS[provider][0]
+                api_key = str(payload.get("api_key", "")).strip()
+                if len(model) > 200:
+                    self._json({"error": "Choose a model."}, HTTPStatus.BAD_REQUEST); return
+                if not api_key and not current.get("api_key"):
+                    self._json({"error": "Provide this workspace's API key for the provider."}, HTTPStatus.BAD_REQUEST); return
+                catalog = ai_model_catalog(current) or AI_PROVIDER_MODELS[provider]
+                if model not in catalog:
+                    catalog = [model, *catalog]
+                stored = {"api_key": api_key or current["api_key"], "base_url": AI_PROVIDERS[provider][2], "model": model, "models": json.dumps(catalog)}
+                if current.get("models_checked_at"):
+                    stored["models_checked_at"] = current["models_checked_at"]
+                save_ai_provider_settings(provider, stored, workspace_id)
+                audit(session["user_id"], "ai_provider.workspace_saved", "workspace", workspace_id, f"Configured workspace {provider} AI provider", self._source_ip(), workspace_id=workspace_id)
+                self._json({"name": provider, "model": model, "has_api_key": True}); return
+            if path.startswith("/api/workspaces/ai-providers/") and path.endswith("/remove"):
+                workspace_id = self._require_workspace(session, "admin")
+                if workspace_id is None:
+                    return
+                provider = unquote(path.split("/")[4])
+                if provider not in AI_PROVIDERS:
+                    self._json({"error": "Choose a supported AI provider."}, HTTPStatus.BAD_REQUEST); return
+                removed = remove_ai_provider_settings(provider, workspace_id)
+                audit(session["user_id"], "ai_provider.workspace_removed", "workspace", workspace_id, f"Removed workspace {provider} API key", self._source_ip(), workspace_id=workspace_id)
+                self._json({"status": "removed" if removed else "not configured", "name": provider}); return
+            if path == "/api/workspaces/settings":
+                workspace_id = self._require_workspace(session, "owner")
+                if workspace_id is None:
+                    return
+                cap = payload.get("ai_monthly_cap")
+                if cap is not None and (not isinstance(cap, int) or isinstance(cap, bool) or cap < 0 or cap > 1_000_000):
+                    self._json({"error": "ai_monthly_cap must be a whole number of AI actions, or null to remove the cap."}, HTTPStatus.BAD_REQUEST); return
+                with db() as connection:
+                    save_workspace_setting(connection, workspace_id, "ai_monthly_cap", str(cap) if cap is not None else None)
+                audit(session["user_id"], "workspace.settings_changed", "workspace", workspace_id, f"Set monthly AI cap to {cap}", self._source_ip(), workspace_id=workspace_id)
+                self._json({"ai_monthly_cap": cap}); return
+            if path == "/api/workspaces/billing/checkout":
+                workspace_id = self._require_workspace(session, "owner")
+                if workspace_id is None:
+                    return
+                if not billing_enabled():
+                    self._json({"error": "Billing is not configured on this Sosopo deployment."}, HTTPStatus.SERVICE_UNAVAILABLE); return
+                plan = str(payload.get("plan", "")).strip()
+                price = config(STRIPE_PLAN_PRICE_VARIABLES.get(plan, ""))
+                if plan not in STRIPE_PLAN_PRICE_VARIABLES or not price:
+                    self._json({"error": "Choose a purchasable plan."}, HTTPStatus.BAD_REQUEST); return
+                base = public_url()
+                if not base.startswith("https://"):
+                    self._json({"error": "Billing requires SOSOPO_PUBLIC_URL with a public HTTPS URL."}, HTTPStatus.BAD_REQUEST); return
+                checkout = stripe_request("checkout/sessions", {
+                    "mode": "subscription",
+                    "line_items[0][price]": price,
+                    "line_items[0][quantity]": "1",
+                    "success_url": f"{base}/?billing=success",
+                    "cancel_url": f"{base}/?billing=cancelled",
+                    "client_reference_id": str(workspace_id),
+                    "metadata[workspace_id]": str(workspace_id),
+                    "metadata[plan]": plan,
+                    "subscription_data[metadata][workspace_id]": str(workspace_id),
+                    "subscription_data[metadata][plan]": plan,
+                })
+                if not checkout.get("url"):
+                    self._json({"error": "The billing provider did not return a checkout URL."}, HTTPStatus.BAD_GATEWAY); return
+                audit(session["user_id"], "billing.checkout_started", "workspace", workspace_id, f"Started {plan} checkout", self._source_ip(), workspace_id=workspace_id)
+                self._json({"url": str(checkout["url"])}); return
             if path == "/api/workspaces/delete":
                 workspace_id = self._require_workspace(session, "owner")
                 if workspace_id is None:
@@ -2314,6 +2669,7 @@ class Handler(SimpleHTTPRequestHandler):
                     duplicate = connection.execute("SELECT id FROM connections WHERE (workspace_id = ? OR user_id = ?) AND provider = ? AND external_account_id = ?", (workspace_id, session["user_id"], provider, account_id)).fetchone()
                     if duplicate:
                         self._json({"error": "This provider account is already connected in this workspace or another of your workspaces."}, HTTPStatus.CONFLICT); return
+                    enforce_connection_limit(connection, workspace_id)
                     connection_id = insert_id(connection,
                         "INSERT INTO connections (user_id, workspace_id, provider, external_account_id, display_name, encrypted_secrets, settings_json, token_expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (session["user_id"], workspace_id, provider, account_id, display_name, encrypt_secrets(secrets_to_store), json.dumps(settings), token_expiry, now()),
@@ -2354,7 +2710,8 @@ class Handler(SimpleHTTPRequestHandler):
                 audit(session["user_id"], "connection.rotated", "connection", connection_id, "Rotated provider credentials", self._source_ip(), workspace_id=workspace_id)
                 self._json({"status": "rotated", "token_expires_at": token_expiry}); return
             if path == "/api/uploads":
-                if self._require_workspace(session, "editor") is None:
+                workspace_id = self._require_workspace(session, "editor")
+                if workspace_id is None:
                     return
                 content_type, encoded = str(payload.get("content_type", "")).lower(), payload.get("data", "")
                 if content_type not in IMAGE_TYPES or not isinstance(encoded, str):
@@ -2369,6 +2726,9 @@ class Handler(SimpleHTTPRequestHandler):
                 if actual_type != content_type:
                     self._json({"error": "Image bytes do not match the declared content type."}, HTTPStatus.BAD_REQUEST); return
                 inspect_image(image, actual_type)
+                with db() as connection:
+                    enforce_storage_limit(connection, workspace_id, len(image))
+                    record_usage(connection, workspace_id, "storage_bytes", len(image), period="total")
                 filename = f"{uuid.uuid4().hex}{IMAGE_TYPES[actual_type]}"
                 self._json({"url": store_media(filename, actual_type, image)}, HTTPStatus.CREATED); return
             if path == "/api/posts":
@@ -2408,6 +2768,8 @@ class Handler(SimpleHTTPRequestHandler):
                         self._json({"error": "Connect an account for each platform when publishing to more than one platform."}, HTTPStatus.BAD_REQUEST); return
                     for channel in channels:
                         validate_post(channel, body, image_url, len(image_urls))
+                    enforce_monthly_quota(connection, workspace_id, "posts_created", "posts_per_month", "posts")
+                    record_usage(connection, workspace_id, "posts_created")
                     post_id = insert_id(connection, "INSERT INTO posts (user_id, workspace_id, body, channel, state, scheduled_for, scheduled_timezone, image_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (session["user_id"], workspace_id, body, channels[0], "scheduled" if schedule else "draft", schedule, schedule_zone if schedule else None, image_url, now()))
                     for target_id in dict.fromkeys(target_ids):
                         connection.execute("INSERT INTO post_targets (post_id, connection_id) VALUES (?, ?)", (post_id, target_id))
