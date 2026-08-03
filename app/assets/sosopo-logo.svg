@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Sosopo</title><desc id="desc">Layered social publishing cards and a spark.</desc>
+  <defs><linearGradient id="a" x1="36" y1="24" x2="218" y2="234" gradientUnits="userSpaceOnUse"><stop stop-color="#9b7bff"/><stop offset="1" stop-color="#6541d9"/></linearGradient><linearGradient id="b" x1="58" y1="33" x2="202" y2="210" gradientUnits="userSpaceOnUse"><stop stop-color="#93f2cf"/><stop offset="1" stop-color="#55cda2"/></linearGradient></defs>
+  <path fill="url(#a)" d="M43 38c-9 2-15 11-13 20l27 126c2 10 12 16 22 14l30-7 18 23 7-31 48-11c10-2 16-12 14-22L169 24c-2-10-12-16-22-14L43 38Z"/><rect width="126" height="126" x="68" y="53" fill="url(#b)" rx="24" transform="rotate(-7 131 116)"/>
+  <path fill="#101722" d="M104 87h28c24 0 39 12 39 31 0 20-16 33-40 33h-11v21h-17V87Zm26 49c15 0 23-6 23-17 0-10-8-16-23-16h-10v33h10Z"/><circle cx="185" cy="50" r="13" fill="#ffd76b"/><path fill="#fff2b5" d="m185 29 4.1 13 12.9 4.1-12.9 4.1-4.1 13-4.1-13-12.9-4.1 12.9-4.1 4.1-13Z"/>
+</svg>

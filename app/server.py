@@ -441,11 +441,11 @@ AI_PROVIDERS = {
 # Provider-owned defaults keep endpoint details out of the administrator UI.
 # A refreshed provider catalog supersedes these choices when available.
 AI_PROVIDER_MODELS = {
-    "OpenAI": ["gpt-5.4-mini", "gpt-5.4", "gpt-4.1-mini"],
-    "OpenRouter": ["openai/gpt-5.4-mini", "anthropic/claude-sonnet-4.6", "moonshotai/kimi-k2.5"],
-    "Kimi": ["kimi-k2.5", "kimi-k2-turbo-preview"],
+    "OpenAI": ["gpt-5.4", "gpt-5.4-mini", "gpt-4.1-mini"],
+    "OpenRouter": ["openai/gpt-5.4", "anthropic/claude-sonnet-4.6", "moonshotai/kimi-k2.5"],
+    "Kimi": ["kimi-k2.5", "kimi-k2-turbo"],
     "MiniMax": ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"],
-    "Z.AI GLM": ["glm-5.1", "glm-5", "glm-4.7"],
+    "Z.AI GLM": ["glm-5.2", "glm-5.1", "glm-5"],
 }
 
 
@@ -519,14 +519,16 @@ def ai_provider_models(provider: str) -> list[str]:
         stored.update({"models": json.dumps(models), "models_checked_at": now()})
         save_ai_provider_settings(provider, stored)
         return models
-    model_list_url = f"{settings['base_url']}/models"
+    # A unique query string bypasses intermediary caches while keeping the
+    # provider's documented models endpoint. Sosopo itself never caches this.
+    model_list_url = f"{settings['base_url']}/models?refresh={int(time.time())}"
     result = request_get_json(model_list_url, {"Authorization": f"Bearer {settings['api_key']}"})
     entries = result.get("data") or result.get("models") or []
     if not isinstance(entries, list):
         raise ProviderError("The AI provider returned an invalid model list.")
     models = []
     for entry in entries:
-        identifier = entry.get("id") if isinstance(entry, dict) else entry if isinstance(entry, str) else None
+        identifier = (entry.get("id") or entry.get("model") or entry.get("name")) if isinstance(entry, dict) else entry if isinstance(entry, str) else None
         if isinstance(identifier, str) and identifier and len(identifier) <= 200:
             models.append(identifier)
     if not models:
