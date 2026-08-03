@@ -470,6 +470,15 @@ def save_ai_provider_settings(provider: str, settings: dict) -> None:
             connection.execute("INSERT INTO instance_settings (name, value) VALUES (?, ?)", (setting_name, encrypt_secrets(settings)))
 
 
+def remove_ai_provider_settings(provider: str) -> bool:
+    """Remove the UI-saved credential and local catalog for one provider."""
+    definition = AI_PROVIDERS.get(provider)
+    if definition is None:
+        raise ProviderError("Choose a supported AI provider.", retryable=False)
+    with db() as connection:
+        return connection.execute("DELETE FROM instance_settings WHERE name = ?", (f"ai_provider_{definition[0]}",)).rowcount == 1
+
+
 def ai_model_catalog(stored: dict) -> list[str]:
     raw = stored.get("models", "[]")
     if isinstance(raw, str):
@@ -1614,6 +1623,15 @@ class Handler(SimpleHTTPRequestHandler):
                 save_ai_provider_settings(provider, stored)
                 audit(session["user_id"], "ai_provider.saved", "instance", provider, f"Configured {provider} AI provider", self._source_ip())
                 self._json({"name": provider, "model": model, "has_api_key": True}); return
+            if path.startswith("/api/admin/ai-providers/") and path.endswith("/remove"):
+                if session["role"] != "admin":
+                    self._json({"error": "Administrator access required."}, HTTPStatus.FORBIDDEN); return
+                provider = unquote(path.split("/")[4])
+                if provider not in AI_PROVIDERS:
+                    self._json({"error": "Choose a supported AI provider."}, HTTPStatus.BAD_REQUEST); return
+                removed = remove_ai_provider_settings(provider)
+                audit(session["user_id"], "ai_provider.removed", "instance", provider, f"Removed {provider} UI-saved API key", self._source_ip())
+                self._json({"status": "removed" if removed else "not configured", "name": provider}); return
             if path == "/api/ai/generate":
                 provider = str(payload.get("provider", ""))
                 model = str(payload.get("model", ""))

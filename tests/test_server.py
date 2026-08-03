@@ -121,6 +121,13 @@ class SosopoTest(unittest.TestCase):
         self.assertEqual({key: settings[key] for key in ("base_url", "model")}, {"base_url": "https://ai.example/v1", "model": "stored-model"})
         self.assertEqual(s.available_ai_providers(), [{"name": "OpenAI", "model": "stored-model", "models": s.AI_PROVIDER_MODELS["OpenAI"]}])
 
+    def test_removing_ai_provider_settings_removes_the_saved_key_and_catalog(self) -> None:
+        s = self.server
+        s.save_ai_provider_settings("MiniMax", {"api_key": "stored-key", "base_url": "https://api.minimax.io/v1", "model": "MiniMax-M2.7", "models": '["MiniMax-M2.7"]'})
+        self.assertTrue(s.remove_ai_provider_settings("MiniMax"))
+        self.assertEqual(s.stored_ai_provider_settings("MiniMax"), {})
+        self.assertFalse(s.remove_ai_provider_settings("MiniMax"))
+
     def test_ai_models_are_fetched_from_the_provider_models_endpoint(self) -> None:
         s = self.server
         with s.db() as connection:
