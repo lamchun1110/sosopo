@@ -74,6 +74,9 @@ CHANNEL_MEDIA_LIMITS = {"Facebook": 10, "Instagram": 10, "Threads": 10, "X": 4, 
 WORKSPACE_ROLES = ("owner", "admin", "editor", "viewer")
 WORKSPACE_ROLE_RANK = {"viewer": 0, "editor": 1, "admin": 2, "owner": 3}
 MAX_WORKSPACE_NAME_LENGTH = 80
+INVITATION_SECONDS = 7 * 24 * 60 * 60
+EXPIRED_INVITATION_RETENTION_DAYS = 30
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 LOGGER = logging.getLogger("sosopo")
 RATE_LIMITS: dict[tuple[str, str], list[float]] = {}
 RATE_LIMIT_LOCK = threading.Lock()
@@ -444,6 +447,22 @@ def setup_database() -> None:
                 FOREIGN KEY(user_id) REFERENCES users(id)
             )""" % id_column
         )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS workspace_invitations (
+                id %s,
+                workspace_id INTEGER NOT NULL,
+                email TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'editor',
+                token_hash TEXT NOT NULL UNIQUE,
+                invited_by INTEGER NOT NULL,
+                expires_at TEXT NOT NULL,
+                accepted_at TEXT,
+                accepted_user_id INTEGER,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(id),
+                FOREIGN KEY(invited_by) REFERENCES users(id)
+            )""" % id_column
+        )
         add_column(connection, "workspace_id", "INTEGER")
         add_table_column(connection, "connections", "workspace_id", "INTEGER")
         add_table_column(connection, "sessions", "active_workspace_id", "INTEGER")
@@ -524,6 +543,80 @@ def ensure_personal_workspace(connection: Database, user_id: int, username: str)
     connection.execute("UPDATE connections SET workspace_id = ? WHERE user_id = ? AND workspace_id IS NULL", (workspace_id, user_id))
     connection.execute("UPDATE audit_events SET workspace_id = ? WHERE user_id = ? AND workspace_id IS NULL", (workspace_id, user_id))
     return workspace_id
+
+
+def deployment_mode() -> str:
+    """self_hosted keeps today's defaults; hosted enables multi-customer behavior."""
+    mode = (config("SOSOPO_DEPLOYMENT_MODE") or "self_hosted").strip().lower()
+    return mode if mode in {"self_hosted", "hosted"} else "self_hosted"
+
+
+def self_signup_allowed() -> bool:
+    value = config("SOSOPO_ALLOW_SELF_SIGNUP").strip().lower()
+    if value in {"1", "true", "yes"}:
+        return True
+    if value in {"0", "false", "no"}:
+        return False
+    return deployment_mode() == "hosted"
+
+
+def create_local_user(connection: Database, username: str, password: str, role: str = "user", timezone: str = "UTC") -> int:
+    salt = secrets.token_bytes(16)
+    return insert_id(
+        connection,
+        "INSERT INTO users (username, password_salt, password_hash, role, timezone, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (username, salt.hex(), hash_password(password, salt), role, timezone, now()),
+    )
+
+
+def send_email(recipient: str, subject: str, body: str) -> bool:
+    """Send one transactional email; return False when unconfigured or delivery fails."""
+    host = config("SOSOPO_SMTP_HOST")
+    if not host:
+        return False
+    import smtplib
+    from email.message import EmailMessage
+    message = EmailMessage()
+    message["From"] = config("SOSOPO_SMTP_FROM") or config("SOSOPO_SMTP_USERNAME") or f"sosopo@{host}"
+    message["To"] = recipient
+    message["Subject"] = subject
+    message.set_content(body)
+    try:
+        with smtplib.SMTP(host, int(config("SOSOPO_SMTP_PORT") or 587), timeout=15) as client:
+            if config("SOSOPO_SMTP_STARTTLS").lower() not in {"0", "false", "no"}:
+                client.starttls()
+            username = config("SOSOPO_SMTP_USERNAME")
+            if username:
+                client.login(username, config("SOSOPO_SMTP_PASSWORD"))
+            client.send_message(message)
+        return True
+    except (OSError, ValueError, smtplib.SMTPException):
+        LOGGER.exception("Transactional email could not be sent")
+        return False
+
+
+def invitation_url(token: str) -> str:
+    base = public_url()
+    return f"{base}/invite?token={quote(token, safe='')}" if base else f"/invite?token={quote(token, safe='')}"
+
+
+def invitation_by_token(connection: Database, token: str) -> Record | None:
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    return connection.execute(
+        "SELECT workspace_invitations.*, workspaces.name AS workspace_name, workspaces.status AS workspace_status"
+        " FROM workspace_invitations JOIN workspaces ON workspaces.id = workspace_invitations.workspace_id"
+        " WHERE workspace_invitations.token_hash = ?",
+        (token_hash,),
+    ).fetchone()
+
+
+def invitation_is_usable(invitation: Record | None) -> bool:
+    return (
+        invitation is not None
+        and invitation["accepted_at"] is None
+        and str(invitation["expires_at"]) > now()
+        and invitation["workspace_status"] == "active"
+    )
 
 
 def migrate_users_to_workspaces(connection: Database) -> None:
@@ -730,6 +823,7 @@ def cleanup_expired_records() -> None:
         connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (now(),))
         connection.execute("DELETE FROM oidc_states WHERE expires_at <= ?", (now(),))
         connection.execute("DELETE FROM social_oauth_states WHERE expires_at <= ?", (now(),))
+        connection.execute("DELETE FROM workspace_invitations WHERE accepted_at IS NULL AND expires_at < ?", ((datetime.now(UTC) - timedelta(days=EXPIRED_INVITATION_RETENTION_DAYS)).isoformat(),))
         connection.execute("DELETE FROM audit_events WHERE created_at < ?", ((datetime.now(UTC) - timedelta(days=retention_days)).isoformat(),))
 
 
@@ -1496,7 +1590,17 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/setup-status":
             with db() as connection:
                 has_user = connection.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
-            self._json({"setup_required": not has_user})
+            self._json({"setup_required": not has_user, "self_signup": self_signup_allowed() and has_user, "deployment_mode": deployment_mode()})
+            return
+        if path.startswith("/api/invitations/") and len(path.split("/")) == 4:
+            if not self._allow("auth", AUTH_REQUESTS_PER_MINUTE):
+                return
+            token = unquote(path.split("/")[3])
+            with db() as connection:
+                invitation = invitation_by_token(connection, token)
+            if not invitation_is_usable(invitation):
+                self._json({"error": "This invitation is invalid, expired, or already used."}, HTTPStatus.NOT_FOUND); return
+            self._json({"workspace": invitation["workspace_name"], "role": invitation["role"], "email": invitation["email"], "expires_at": invitation["expires_at"]})
             return
         if path == "/api/session":
             session = self._require_auth()
@@ -1684,6 +1788,20 @@ class Handler(SimpleHTTPRequestHandler):
                 workspaces = [{"id": item["id"], "name": item["name"], "slug": item["slug"], "role": item["role"], "is_owner": item["owner_user_id"] == session["user_id"]} for item in user_workspaces(connection, session["user_id"])]
             self._json({"workspaces": workspaces, "active_workspace_id": session.get("workspace_id")})
             return
+        if path == "/api/workspaces/invitations":
+            session = self._session()
+            workspace_id = self._require_workspace(session, "admin")
+            if workspace_id is None:
+                return
+            with db() as connection:
+                invitations = [dict(row) for row in connection.execute(
+                    "SELECT id, email, role, expires_at, created_at FROM workspace_invitations WHERE workspace_id = ? AND accepted_at IS NULL ORDER BY id DESC",
+                    (workspace_id,),
+                ).fetchall()]
+            for invitation in invitations:
+                invitation["expired"] = str(invitation["expires_at"]) <= now()
+            self._json({"invitations": invitations})
+            return
         if path == "/api/workspaces/members":
             session = self._session()
             workspace_id = self._require_workspace(session, "admin")
@@ -1728,7 +1846,7 @@ class Handler(SimpleHTTPRequestHandler):
             with upload.open("rb") as file:
                 self.copyfile(file, self.wfile)
             return
-        if self.path == "/":
+        if self.path == "/" or path == "/invite":
             self.path = "/index.html"
         return super().do_GET()
 
@@ -1775,6 +1893,54 @@ class Handler(SimpleHTTPRequestHandler):
                 if user is None or not secrets.compare_digest(hash_password(password, bytes.fromhex(user["password_salt"])), user["password_hash"]):
                     self._json({"error": "Invalid username or password."}, HTTPStatus.UNAUTHORIZED); return
                 self._json_session({"username": user["username"]}, self._create_session(user["id"])); return
+            if path == "/api/signup":
+                if not self._allow("auth", AUTH_REQUESTS_PER_MINUTE): return
+                if not self_signup_allowed():
+                    self._json({"error": "Self-service signup is disabled on this Sosopo instance."}, HTTPStatus.FORBIDDEN); return
+                username, password = str(payload.get("username", "")).strip(), str(payload.get("password", ""))
+                if len(username) < 3 or len(password) < 12:
+                    self._json({"error": "Use a username of at least 3 characters and a password of at least 12 characters."}, HTTPStatus.BAD_REQUEST); return
+                with db() as connection:
+                    if connection.execute("SELECT 1 FROM users LIMIT 1").fetchone() is None:
+                        self._json({"error": "Complete first-run setup before self-service signup."}, HTTPStatus.CONFLICT); return
+                    if connection.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+                        self._json({"error": "That username is already taken."}, HTTPStatus.CONFLICT); return
+                    user_id = create_local_user(connection, username, password)
+                    ensure_personal_workspace(connection, user_id, username)
+                audit(user_id, "user.signed_up", "user", user_id, "Self-service signup", self._source_ip())
+                self._json_session({"username": username}, self._create_session(user_id), HTTPStatus.CREATED); return
+            if path.startswith("/api/invitations/") and path.endswith("/accept"):
+                if not self._allow("auth", AUTH_REQUESTS_PER_MINUTE): return
+                token = unquote(path.split("/")[3])
+                session = self._session()
+                with db() as connection:
+                    invitation = invitation_by_token(connection, token)
+                    if not invitation_is_usable(invitation):
+                        self._json({"error": "This invitation is invalid, expired, or already used."}, HTTPStatus.BAD_REQUEST); return
+                    if session is not None:
+                        user_id, username = int(session["user_id"]), str(session["username"])
+                    else:
+                        username, password = str(payload.get("username", "")).strip(), str(payload.get("password", ""))
+                        if len(username) < 3 or len(password) < 12:
+                            self._json({"error": "Use a username of at least 3 characters and a password of at least 12 characters."}, HTTPStatus.BAD_REQUEST); return
+                        if connection.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+                            self._json({"error": "That username is already taken. Sign in first, then open the invite link again."}, HTTPStatus.CONFLICT); return
+                        user_id = create_local_user(connection, username, password)
+                    workspace_id = int(invitation["workspace_id"])
+                    if connection.execute("SELECT 1 FROM workspace_memberships WHERE workspace_id = ? AND user_id = ?", (workspace_id, user_id)).fetchone() is None:
+                        connection.execute(
+                            "INSERT INTO workspace_memberships (workspace_id, user_id, role, invite_state, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)",
+                            (workspace_id, user_id, invitation["role"], now(), now()),
+                        )
+                    connection.execute("UPDATE workspace_invitations SET accepted_at = ?, accepted_user_id = ? WHERE id = ?", (now(), user_id, invitation["id"]))
+                    if session is not None:
+                        connection.execute("UPDATE sessions SET active_workspace_id = ? WHERE id = ?", (workspace_id, session["id"]))
+                audit(user_id, "workspace.invitation_accepted", "workspace", invitation["workspace_id"], f"{username} accepted a {invitation['role']} invitation", self._source_ip(), workspace_id=int(invitation["workspace_id"]))
+                if session is None:
+                    self._json_session({"username": username, "workspace": invitation["workspace_name"]}, self._create_session(user_id), HTTPStatus.CREATED)
+                else:
+                    self._json({"username": username, "workspace": invitation["workspace_name"]})
+                return
             if not self._allow("write", WRITE_REQUESTS_PER_MINUTE):
                 return
             if path == "/api/logout":
@@ -1943,6 +2109,45 @@ class Handler(SimpleHTTPRequestHandler):
                     connection.execute("DELETE FROM workspace_memberships WHERE id = ?", (membership["id"],))
                 audit(session["user_id"], "workspace.member_removed", "user", member_user_id, "Removed workspace member", self._source_ip(), workspace_id=workspace_id)
                 self._json({"status": "removed"}); return
+            if path == "/api/workspaces/invitations":
+                workspace_id = self._require_workspace(session, "admin")
+                if workspace_id is None:
+                    return
+                email, invite_role = str(payload.get("email", "")).strip().lower(), str(payload.get("role", "editor")).strip()
+                if len(email) > 254 or not EMAIL_PATTERN.fullmatch(email):
+                    self._json({"error": "Enter a valid invitation email address."}, HTTPStatus.BAD_REQUEST); return
+                if invite_role not in {"viewer", "editor", "admin"}:
+                    self._json({"error": "Grant the viewer, editor, or admin role."}, HTTPStatus.BAD_REQUEST); return
+                if invite_role == "admin" and session["workspace_role"] != "owner":
+                    self._json({"error": "Only the workspace owner can grant the admin role."}, HTTPStatus.FORBIDDEN); return
+                token = secrets.token_urlsafe(32)
+                expires = (datetime.now(UTC) + timedelta(seconds=INVITATION_SECONDS)).isoformat()
+                with db() as connection:
+                    connection.execute("DELETE FROM workspace_invitations WHERE workspace_id = ? AND email = ? AND accepted_at IS NULL", (workspace_id, email))
+                    invitation_id = insert_id(
+                        connection,
+                        "INSERT INTO workspace_invitations (workspace_id, email, role, token_hash, invited_by, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (workspace_id, email, invite_role, hashlib.sha256(token.encode()).hexdigest(), session["user_id"], expires, now()),
+                    )
+                link = invitation_url(token)
+                email_sent = send_email(
+                    email,
+                    f"You are invited to the {session['workspace_name']} workspace on Sosopo",
+                    f"{session['username']} invited you to join the {session['workspace_name']} workspace as {invite_role}.\n\nOpen this link to accept (valid for 7 days):\n{link}\n\nIf you did not expect this invitation, ignore this email.",
+                )
+                audit(session["user_id"], "workspace.invitation_created", "workspace", workspace_id, f"Invited {email} as {invite_role}", self._source_ip(), workspace_id=workspace_id)
+                self._json({"id": invitation_id, "email": email, "role": invite_role, "expires_at": expires, "invite_url": link, "email_sent": email_sent}, HTTPStatus.CREATED); return
+            if path.startswith("/api/workspaces/invitations/") and path.endswith("/revoke"):
+                workspace_id = self._require_workspace(session, "admin")
+                if workspace_id is None:
+                    return
+                invitation_id = int(path.split("/")[4])
+                with db() as connection:
+                    removed = connection.execute("DELETE FROM workspace_invitations WHERE id = ? AND workspace_id = ? AND accepted_at IS NULL", (invitation_id, workspace_id))
+                if removed.rowcount != 1:
+                    self._json({"error": "Invitation not found."}, HTTPStatus.NOT_FOUND); return
+                audit(session["user_id"], "workspace.invitation_revoked", "workspace", invitation_id, "Revoked pending invitation", self._source_ip(), workspace_id=workspace_id)
+                self._json({"status": "revoked"}); return
             if path == "/api/admin/users":
                 if session["role"] != "admin":
                     self._json({"error": "Administrator access required."}, HTTPStatus.FORBIDDEN); return

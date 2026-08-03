@@ -79,7 +79,9 @@ class WorkspaceMigrationTest(WorkspaceTestCase):
         self.assertFalse(s.workspace_role_allows("stranger", "viewer"))
 
 
-class WorkspaceApiTest(WorkspaceTestCase):
+class WorkspaceHttpCase(WorkspaceTestCase):
+    """Shared live-HTTP harness for tenant-isolation and authorization tests."""
+
     def setUp(self) -> None:
         super().setUp()
         quiet = type("QuietHandler", (self.server.Handler,), {"log_message": lambda self, *args: None})
@@ -127,6 +129,8 @@ class WorkspaceApiTest(WorkspaceTestCase):
         self.assertEqual(status, 200)
         return payload
 
+
+class WorkspaceApiTest(WorkspaceHttpCase):
     def test_setup_creates_an_owner_workspace_session(self) -> None:
         admin = self.setup_admin()
         payload = self.active_workspace(admin)
