@@ -86,7 +86,7 @@ class SosopoTest(unittest.TestCase):
         try:
             settings = self.server.ai_provider_settings("OpenAI")
             self.assertEqual(settings["base_url"], "https://api.openai.com/v1")
-            self.assertEqual(self.server.available_ai_providers(), [{"name": "OpenAI", "model": "test-model", "models": []}])
+            self.assertEqual(self.server.available_ai_providers(), [{"name": "OpenAI", "model": "test-model", "models": self.server.AI_PROVIDER_MODELS["OpenAI"]}])
         finally:
             os.environ.pop("SOSOPO_AI_OPENAI_API_KEY", None)
             os.environ.pop("SOSOPO_AI_OPENAI_MODEL", None)
@@ -97,7 +97,7 @@ class SosopoTest(unittest.TestCase):
             connection.execute("INSERT INTO instance_settings (name, value) VALUES (?, ?)", ("ai_provider_openai", s.encrypt_secrets({"api_key": "stored-key", "base_url": "https://ai.example/v1", "model": "stored-model"})))
         settings = s.ai_provider_settings("OpenAI")
         self.assertEqual({key: settings[key] for key in ("base_url", "model")}, {"base_url": "https://ai.example/v1", "model": "stored-model"})
-        self.assertEqual(s.available_ai_providers(), [{"name": "OpenAI", "model": "stored-model", "models": []}])
+        self.assertEqual(s.available_ai_providers(), [{"name": "OpenAI", "model": "stored-model", "models": s.AI_PROVIDER_MODELS["OpenAI"]}])
 
     def test_ai_models_are_fetched_from_the_provider_models_endpoint(self) -> None:
         s = self.server

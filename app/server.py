@@ -433,9 +433,19 @@ def config(name: str) -> str:
 AI_PROVIDERS = {
     "OpenAI": ("openai", "SOSOPO_AI_OPENAI", "https://api.openai.com/v1"),
     "OpenRouter": ("openrouter", "SOSOPO_AI_OPENROUTER", "https://openrouter.ai/api/v1"),
-    "Kimi": ("kimi", "SOSOPO_AI_KIMI", ""),
-    "MiniMax": ("minimax", "SOSOPO_AI_MINIMAX", ""),
-    "Z.AI GLM": ("zai", "SOSOPO_AI_ZAI", ""),
+    "Kimi": ("kimi", "SOSOPO_AI_KIMI", "https://api.moonshot.ai/v1"),
+    "MiniMax": ("minimax", "SOSOPO_AI_MINIMAX", "https://api.minimax.io/v1"),
+    "Z.AI GLM": ("zai", "SOSOPO_AI_ZAI", "https://api.z.ai/api/paas/v4"),
+}
+
+# Provider-owned defaults keep endpoint details out of the administrator UI.
+# A refreshed provider catalog supersedes these choices when available.
+AI_PROVIDER_MODELS = {
+    "OpenAI": ["gpt-5.4-mini", "gpt-5.4", "gpt-4.1-mini"],
+    "OpenRouter": ["openai/gpt-5.4-mini", "anthropic/claude-sonnet-4.6", "moonshotai/kimi-k2.5"],
+    "Kimi": ["kimi-k2.5", "kimi-k2-turbo-preview"],
+    "MiniMax": ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"],
+    "Z.AI GLM": ["glm-5.1", "glm-5", "glm-4.7"],
 }
 
 
@@ -479,7 +489,7 @@ def ai_provider_settings(provider: str) -> dict[str, str]:
     stored = stored_ai_provider_settings(provider)
     api_key = stored.get("api_key") or config(f"{prefix}_API_KEY")
     base_url = stored.get("base_url") or config(f"{prefix}_BASE_URL") or default_base
-    model = stored.get("model") or config(f"{prefix}_MODEL")
+    model = stored.get("model") or config(f"{prefix}_MODEL") or AI_PROVIDER_MODELS[provider][0]
     if not api_key or not base_url.startswith("https://") or not model:
         raise ProviderError(f"{provider} AI is not configured by this Sosopo administrator.", retryable=False)
     return {"name": provider, "api_key": api_key, "base_url": base_url.rstrip("/"), "model": model}
@@ -491,7 +501,7 @@ def available_ai_providers() -> list[dict]:
         try:
             settings = ai_provider_settings(name)
             stored = stored_ai_provider_settings(name)
-            models = ai_model_catalog(stored)
+            models = ai_model_catalog(stored) or AI_PROVIDER_MODELS[name]
             providers.append({"name": settings["name"], "model": settings["model"], "models": models})
         except ProviderError:
             pass
@@ -502,9 +512,14 @@ def ai_provider_models(provider: str) -> list[str]:
     """Refresh the provider's model catalog using its configured discovery endpoint."""
     settings = ai_provider_settings(provider)
     stored = stored_ai_provider_settings(provider)
-    model_list_url = str(stored.get("model_list_url", "")).strip() or f"{settings['base_url']}/models"
-    if not model_list_url.startswith("https://") or len(model_list_url) > 500:
-        raise ProviderError("Use an HTTPS model-list URL.", retryable=False)
+    # MiniMax's direct chat API does not expose the same OpenAI model-list
+    # contract. Its official supported chat models are maintained as presets.
+    if provider == "MiniMax":
+        models = AI_PROVIDER_MODELS[provider]
+        stored.update({"models": json.dumps(models), "models_checked_at": now()})
+        save_ai_provider_settings(provider, stored)
+        return models
+    model_list_url = f"{settings['base_url']}/models"
     result = request_get_json(model_list_url, {"Authorization": f"Bearer {settings['api_key']}"})
     entries = result.get("data") or result.get("models") or []
     if not isinstance(entries, list):
@@ -534,7 +549,9 @@ def generate_post_copy(provider: str, model: str, instruction: str, draft: str, 
     if len(selected_model) > 200 or len(instruction) > 2_000 or len(draft) > 5_000:
         raise ProviderError("AI request is too long.", retryable=False)
     prompt = f"Write one ready-to-publish social media post. Platforms: {', '.join(channels) or 'general social media'}. Brief: {instruction.strip() or 'Improve the draft below.'}\nDraft to improve (may be empty):\n{draft.strip()}"
-    result = request_json(f"{settings['base_url']}/chat/completions", {"model": selected_model, "messages": [{"role": "system", "content": "You are Sosopo's concise social-media copywriter. Return only the finished post copy; do not add a title, explanation, markdown fence, or quotation marks."}, {"role": "user", "content": prompt}], "temperature": 0.7, "max_tokens": 700}, {"Authorization": f"Bearer {settings['api_key']}"})
+    messages = [{"role": "system", "content": "You are Sosopo's concise social-media copywriter. Return only the finished post copy; do not add a title, explanation, markdown fence, or quotation marks."}, {"role": "user", "content": prompt}]
+    endpoint = f"{settings['base_url']}/text/chatcompletion_v2" if provider == "MiniMax" else f"{settings['base_url']}/chat/completions"
+    result = request_json(endpoint, {"model": selected_model, "messages": messages, "temperature": 0.7, "max_tokens": 700}, {"Authorization": f"Bearer {settings['api_key']}"})
     choices = result.get("choices", [])
     content = choices[0].get("message", {}).get("content", "") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else ""
     if not isinstance(content, str) or not content.strip():
@@ -1385,9 +1402,8 @@ class Handler(SimpleHTTPRequestHandler):
             providers = []
             for name, (slug, _, default_base) in AI_PROVIDERS.items():
                 stored = stored_ai_provider_settings(name)
-                if stored:
-                    catalog = ai_model_catalog(stored)
-                    providers.append({"name": name, "base_url": stored.get("base_url") or default_base, "model": stored.get("model", ""), "model_list_url": stored.get("model_list_url", ""), "models_count": len(catalog), "models_checked_at": stored.get("models_checked_at"), "has_api_key": bool(stored.get("api_key"))})
+                catalog = ai_model_catalog(stored)
+                providers.append({"name": name, "model": stored.get("model", AI_PROVIDER_MODELS[name][0]), "models": catalog or AI_PROVIDER_MODELS[name], "models_count": len(catalog), "models_checked_at": stored.get("models_checked_at"), "has_api_key": bool(stored.get("api_key"))})
             self._json({"providers": providers}); return
         if path.startswith("/api/admin/ai-providers/") and path.endswith("/models"):
             session = self._session()
@@ -1514,23 +1530,22 @@ class Handler(SimpleHTTPRequestHandler):
                 definition = AI_PROVIDERS.get(provider)
                 if definition is None:
                     self._json({"error": "Choose a supported AI provider."}, HTTPStatus.BAD_REQUEST); return
-                base_url = str(payload.get("base_url", "")).strip() or definition[2]
                 model = str(payload.get("model", "")).strip()
                 api_key = str(payload.get("api_key", "")).strip()
-                model_list_url = str(payload.get("model_list_url", "")).strip()
-                if not base_url.startswith("https://") or len(base_url) > 500 or not model or len(model) > 200 or (model_list_url and (not model_list_url.startswith("https://") or len(model_list_url) > 500)):
-                    self._json({"error": "Use an HTTPS base URL and a model ID of 200 characters or fewer."}, HTTPStatus.BAD_REQUEST); return
+                if not model or len(model) > 200:
+                    self._json({"error": "Choose a model."}, HTTPStatus.BAD_REQUEST); return
                 current = stored_ai_provider_settings(provider)
                 if not api_key and not current.get("api_key"):
                     self._json({"error": "Provide an API key for this provider."}, HTTPStatus.BAD_REQUEST); return
-                # Keep the selected model even when the catalog is refreshed later;
-                # changing endpoints invalidates the old catalog.
-                stored = {"api_key": api_key or current["api_key"], "base_url": base_url, "model": model, "model_list_url": model_list_url}
-                if current.get("base_url") == base_url and current.get("model_list_url", "") == model_list_url:
-                    stored.update({key: current[key] for key in ("models", "models_checked_at") if key in current})
+                catalog = ai_model_catalog(current) or AI_PROVIDER_MODELS[provider]
+                if model not in catalog:
+                    self._json({"error": "Choose a model from the provider list."}, HTTPStatus.BAD_REQUEST); return
+                stored = {"api_key": api_key or current["api_key"], "base_url": definition[2], "model": model, "models": json.dumps(catalog)}
+                if current.get("models_checked_at"):
+                    stored["models_checked_at"] = current["models_checked_at"]
                 save_ai_provider_settings(provider, stored)
                 audit(session["user_id"], "ai_provider.saved", "instance", provider, f"Configured {provider} AI provider", self._source_ip())
-                self._json({"name": provider, "base_url": base_url, "model": model, "has_api_key": True}); return
+                self._json({"name": provider, "model": model, "has_api_key": True}); return
             if path == "/api/ai/generate":
                 provider = str(payload.get("provider", ""))
                 model = str(payload.get("model", ""))
