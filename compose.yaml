@@ -103,6 +103,28 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+  sosopo-docs:
+    build: .
+    command: ["python", "-m", "http.server", "8080", "--directory", "/app/docs"]
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    ports:
+      - "127.0.0.1:8090:8080"
+    networks:
+      - frontend
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
   sosopo-worker:
     build: .
     command: ["python", "/app/app/worker.py"]

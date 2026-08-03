@@ -4,6 +4,12 @@ Sosopo is a self-hosted social-media publishing workspace. It supports local acc
 
 Licensed under [MIT](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) for local checks and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
+## Documentation website
+
+Sosopo ships a separate, responsive documentation site in `docs/`. Compose runs it as the independent `sosopo-docs` service on `127.0.0.1:8090`; it does not share the application session or database. It contains first-run setup, channel connection, publishing, AI-provider, operational, and troubleshooting guides.
+
+For a Cloudflare Tunnel, Traefik, Caddy, or Nginx Proxy Manager deployment, route a separate hostname such as `docs.sosopo.jacky.tech` to `http://sosopo-docs:8080` on the shared `frontend` Docker network. The service is ready after `docker compose up -d --build`; use `curl -fsS http://127.0.0.1:8090/` to verify it locally.
+
 ## What works today
 
 - Create drafts for Facebook, Instagram, Threads, X, Telegram, Discord, and LinkedIn.

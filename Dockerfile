@@ -7,6 +7,8 @@ RUN apt-get update \
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY app /app/app
+COPY docs /app/docs
+COPY app/assets /app/docs/assets
 COPY scripts /app/scripts
 
 RUN useradd --create-home --uid 10001 sosopo \
