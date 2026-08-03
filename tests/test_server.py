@@ -111,6 +111,19 @@ class SosopoTest(unittest.TestCase):
         finally:
             s.request_get_json = original_request_get_json
 
+    def test_minimax_model_refresh_uses_its_live_models_endpoint(self) -> None:
+        s = self.server
+        with s.db() as connection:
+            connection.execute("INSERT INTO instance_settings (name, value) VALUES (?, ?)", ("ai_provider_minimax", s.encrypt_secrets({"api_key": "stored-key", "base_url": "https://api.minimax.io/v1", "model": "MiniMax-M2.7"})))
+        calls = []
+        original_request_get_json = s.request_get_json
+        s.request_get_json = lambda url, headers=None: calls.append(url) or {"data": [{"id": "MiniMax-M2.8"}]}
+        try:
+            self.assertEqual(s.ai_provider_models("MiniMax"), ["MiniMax-M2.8"])
+            self.assertTrue(calls[0].startswith("https://api.minimax.io/v1/models?refresh="))
+        finally:
+            s.request_get_json = original_request_get_json
+
     def test_ai_generation_rejects_models_outside_the_saved_catalog(self) -> None:
         s = self.server
         with s.db() as connection:

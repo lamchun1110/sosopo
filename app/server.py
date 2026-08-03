@@ -441,10 +441,10 @@ AI_PROVIDERS = {
 # Provider-owned defaults keep endpoint details out of the administrator UI.
 # A refreshed provider catalog supersedes these choices when available.
 AI_PROVIDER_MODELS = {
-    "OpenAI": ["gpt-5.4", "gpt-5.4-mini", "gpt-4.1-mini"],
-    "OpenRouter": ["openai/gpt-5.4", "anthropic/claude-sonnet-4.6", "moonshotai/kimi-k2.5"],
+    "OpenAI": ["gpt-5.2", "gpt-5.2-mini", "gpt-4.1-mini"],
+    "OpenRouter": ["openai/gpt-5.2", "anthropic/claude-sonnet-4.6", "moonshotai/kimi-k2.5"],
     "Kimi": ["kimi-k2.5", "kimi-k2-turbo"],
-    "MiniMax": ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"],
+    "MiniMax": ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed", "M2-her"],
     "Z.AI GLM": ["glm-5.2", "glm-5.1", "glm-5"],
 }
 
@@ -512,13 +512,6 @@ def ai_provider_models(provider: str) -> list[str]:
     """Refresh the provider's model catalog using its configured discovery endpoint."""
     settings = ai_provider_settings(provider)
     stored = stored_ai_provider_settings(provider)
-    # MiniMax's direct chat API does not expose the same OpenAI model-list
-    # contract. Its official supported chat models are maintained as presets.
-    if provider == "MiniMax":
-        models = AI_PROVIDER_MODELS[provider]
-        stored.update({"models": json.dumps(models), "models_checked_at": now()})
-        save_ai_provider_settings(provider, stored)
-        return models
     # A unique query string bypasses intermediary caches while keeping the
     # provider's documented models endpoint. Sosopo itself never caches this.
     model_list_url = f"{settings['base_url']}/models?refresh={int(time.time())}"
