@@ -64,7 +64,7 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-`.env` is ignored by Docker build context and must never be committed. `SOSOPO_ENCRYPTION_KEY` is used to encrypt future stored connection credentials; do not change it after accounts have been connected. The current environment variables remain supported for the first single-account publishing path.
+`.env` is ignored by Docker build context and must never be committed. **Set a valid, persistent `SOSOPO_ENCRYPTION_KEY` and restart Sosopo before saving any channel or AI-provider API key.** It encrypts stored credentials; do not change it after accounts have been connected. The current environment variables remain supported for the first single-account publishing path.
 
 Every sensitive setting also accepts a `_FILE` variant. This is recommended for Docker Secrets, Kubernetes Secrets, or a mounted secret-manager volume: for example set `SOSOPO_ENCRYPTION_KEY_FILE=/run/secrets/sosopo_encryption_key` or `DATABASE_URL_FILE=/run/secrets/sosopo_database_url`. The file contents are read at startup and override the matching environment value. Mount the secret read-only and restart both services after rotation.
 
@@ -76,7 +76,7 @@ Local disk (`SOSOPO_STORAGE_BACKEND=local`) is the default and stores uploads in
 
 Sosopo can generate draft post copy inside the composer. An administrator configures it in the dedicated **AI providers** tab in the left rail: choose OpenAI, OpenRouter, Kimi, MiniMax, or Z.AI GLM; paste the provider API key; and choose the default model from a dropdown. Credentials are encrypted at rest and never returned to the browser. Sosopo owns the provider endpoint presets, so administrators do not need to enter a base URL or model-list URL.
 
-Each provider starts with a maintained set of sensible text-model choices. OpenAI includes the GPT-5.6 Sol/Terra/Luna and GPT-5.5 entries requested by the workspace; Kimi includes K3, K2.7 Code, and K2.6; MiniMax includes M3 and current M2 variants. After saving, use **Refresh model list** to load and save the provider's account-visible catalog. OpenRouter’s public catalog can be refreshed before saving a key. The composer uses the first configured provider and its selected default model, so collaborators never need to manage provider credentials or model IDs.
+Each provider starts with a maintained set of sensible text-model choices. OpenAI includes the GPT-5.6 Sol/Terra/Luna and GPT-5.5 entries requested by the workspace; Kimi includes K3, K2.7 Code, and K2.6; MiniMax includes M3 and current M2 variants. The setup order is important: **(1)** set `SOSOPO_ENCRYPTION_KEY` and restart the stack, **(2)** paste the provider API key and click **Save AI provider**, then **(3)** click **Refresh model list**. Refreshing needs the saved API key for providers that protect their catalog; OpenRouter is the exception because its catalog is public. The composer uses the first configured provider and its selected default model, so collaborators never need to manage provider credentials or model IDs.
 
 For **MiniMax Token Plan**, paste the Token Plan API key from the MiniMax console into the MiniMax provider entry and save it. Sosopo selects `MiniMax-M2.7` by default, so saving does not require a successful model refresh. Refreshing later calls MiniMax’s documented `https://api.minimax.io/v1/models` endpoint with that bearer token; it updates the dropdown only when MiniMax makes the catalog available to the key.
 
