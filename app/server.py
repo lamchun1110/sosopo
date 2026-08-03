@@ -92,6 +92,24 @@ PLAN_LIMITS: dict[str, dict[str, int] | None] = {
 }
 STRIPE_PLAN_PRICE_VARIABLES = {"starter": "STRIPE_PRICE_STARTER", "pro": "STRIPE_PRICE_PRO"}
 STRIPE_WEBHOOK_TOLERANCE_SECONDS = 300
+MEDIA_JOB_KINDS = ("image", "video")
+MAX_MEDIA_PROMPT_LENGTH = 2_000
+MAX_MEDIA_STYLE_LENGTH = 200
+MAX_MEDIA_DOWNLOAD_BYTES = 100 * 1024 * 1024
+MEDIA_IMAGE_SIZES = {"1:1": "1024x1024", "3:2": "1536x1024", "2:3": "1024x1536", "16:9": "1792x1024", "9:16": "1024x1792"}
+MEDIA_VIDEO_SIZES = {"16:9": "1280x720", "9:16": "720x1280", "1:1": "720x720"}
+VIDEO_POLL_SECONDS = 10
+VIDEO_POLL_LIMIT = 90
+# Media-capable models per provider. Only OpenAI-compatible media APIs are
+# called; providers absent from a map cannot run that media kind.
+AI_PROVIDER_IMAGE_MODELS = {
+    "OpenAI": ["gpt-image-1.5", "gpt-image-1"],
+    "OpenRouter": ["openai/gpt-image-1.5", "google/gemini-2.5-flash-image"],
+    "Z.AI GLM": ["cogview-4.5"],
+}
+AI_PROVIDER_VIDEO_MODELS = {
+    "OpenAI": ["sora-2.2", "sora-2"],
+}
 LOGGER = logging.getLogger("sosopo")
 RATE_LIMITS: dict[tuple[str, str], list[float]] = {}
 RATE_LIMIT_LOCK = threading.Lock()
@@ -494,6 +512,31 @@ def setup_database() -> None:
                 FOREIGN KEY(invited_by) REFERENCES users(id)
             )""" % id_column
         )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS media_jobs (
+                id %s,
+                workspace_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                aspect_ratio TEXT NOT NULL DEFAULT '1:1',
+                style TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'queued',
+                progress INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                result_url TEXT,
+                moderation TEXT NOT NULL DEFAULT 'pending',
+                reviewed_by INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(id),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )""" % id_column
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS media_jobs_queue ON media_jobs(status, id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS media_jobs_workspace ON media_jobs(workspace_id, id)")
         connection.execute(
             """CREATE TABLE IF NOT EXISTS usage_records (
                 workspace_id INTEGER NOT NULL,
@@ -1022,6 +1065,128 @@ def generate_post_copy(provider: str, model: str, instruction: str, draft: str, 
     if not isinstance(content, str) or not content.strip():
         raise ProviderError("The AI provider did not return post copy.")
     return content.strip()
+
+
+def request_get_bytes(url: str, headers: dict[str, str] | None = None) -> bytes:
+    """Download one generated media object with a hard size cap."""
+    request = Request(url, headers=headers or {})
+    try:
+        with urlopen(request, timeout=120) as response:
+            content = response.read(MAX_MEDIA_DOWNLOAD_BYTES + 1)
+    except (HTTPError, URLError) as error:
+        raise ProviderError("The generated media could not be downloaded from the provider.") from error
+    if not content or len(content) > MAX_MEDIA_DOWNLOAD_BYTES:
+        raise ProviderError("The generated media is empty or larger than the download limit.")
+    return content
+
+
+def default_media_model(provider: str, kind: str) -> str:
+    models = (AI_PROVIDER_IMAGE_MODELS if kind == "image" else AI_PROVIDER_VIDEO_MODELS).get(provider) or []
+    return models[0] if models else ""
+
+
+def media_job_prompt(job: dict[str, Any]) -> str:
+    style = str(job.get("style") or "").strip()
+    prompt = str(job["prompt"]).strip()
+    return f"{prompt}\n\nVisual style: {style}" if style else prompt
+
+
+def store_generated_media(job: dict[str, Any], content: bytes, content_type: str, suffix: str) -> str:
+    with db() as connection:
+        enforce_storage_limit(connection, int(job["workspace_id"]), len(content))
+        record_usage(connection, int(job["workspace_id"]), "storage_bytes", len(content), period="total")
+    return store_media(f"{uuid.uuid4().hex}{suffix}", content_type, content)
+
+
+def generate_image_media(job: dict[str, Any], settings: dict[str, str]) -> str:
+    payload = {"model": job["model"] or default_media_model(job["provider"], "image"), "prompt": media_job_prompt(job), "size": MEDIA_IMAGE_SIZES.get(str(job["aspect_ratio"]), "1024x1024"), "n": 1}
+    result = request_json(f"{settings['base_url']}/images/generations", payload, {"Authorization": f"Bearer {settings['api_key']}"})
+    data = result.get("data")
+    first = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else {}
+    if first.get("b64_json"):
+        try:
+            content = base64.b64decode(str(first["b64_json"]), validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ProviderError("The AI provider returned unreadable image data.") from error
+    elif first.get("url"):
+        content = request_get_bytes(str(first["url"]))
+    else:
+        raise ProviderError("The AI provider did not return an image.")
+    image_type = detected_image_type(content)
+    if image_type is None:
+        raise ProviderError("The AI provider returned an unsupported image format.")
+    inspect_image(content, image_type)
+    return store_generated_media(job, content, image_type, IMAGE_TYPES[image_type])
+
+
+def generate_video_media(job: dict[str, Any], settings: dict[str, str]) -> str:
+    """Run one provider-side asynchronous video job (OpenAI-style /videos API)."""
+    headers = {"Authorization": f"Bearer {settings['api_key']}"}
+    model = job["model"] or default_media_model(job["provider"], "video")
+    creation = request_json(f"{settings['base_url']}/videos", {"model": model, "prompt": media_job_prompt(job), "size": MEDIA_VIDEO_SIZES.get(str(job["aspect_ratio"]), "1280x720")}, headers)
+    video_id = str(creation.get("id") or "")
+    if not video_id:
+        raise ProviderError("The AI provider did not accept the video job.")
+    for _ in range(VIDEO_POLL_LIMIT):
+        time.sleep(VIDEO_POLL_SECONDS)
+        remote = request_get_json(f"{settings['base_url']}/videos/{quote(video_id, safe='')}", headers)
+        state = str(remote.get("status") or "")
+        try:
+            progress = min(max(int(remote.get("progress") or 0), 5), 99)
+        except (TypeError, ValueError):
+            progress = 50
+        with db() as connection:
+            connection.execute("UPDATE media_jobs SET progress = ?, updated_at = ? WHERE id = ?", (progress, now(), job["id"]))
+        if state == "completed":
+            content = request_get_bytes(f"{settings['base_url']}/videos/{quote(video_id, safe='')}/content", headers)
+            return store_generated_media(job, content, "video/mp4", ".mp4")
+        if state in {"failed", "cancelled", "expired"}:
+            detail = remote.get("error", {}).get("message") if isinstance(remote.get("error"), dict) else ""
+            raise ProviderError(f"The provider video job {state}: {detail or 'no detail returned'}"[:400])
+    raise ProviderError("The provider video job did not finish in time.")
+
+
+def claim_media_job() -> Record | None:
+    with db() as connection:
+        row = connection.execute("SELECT id FROM media_jobs WHERE status = 'queued' ORDER BY id LIMIT 1").fetchone()
+        if row is None:
+            return None
+        claimed = connection.execute("UPDATE media_jobs SET status = 'running', progress = 5, updated_at = ? WHERE id = ? AND status = 'queued'", (now(), row["id"]))
+        if claimed.rowcount != 1:
+            return None
+        return connection.execute("SELECT * FROM media_jobs WHERE id = ?", (row["id"],)).fetchone()
+
+
+def run_media_job(job: dict[str, Any]) -> None:
+    """Generate one media asset; on failure record the error and refund the credit."""
+    try:
+        settings = ai_provider_settings(str(job["provider"]), int(job["workspace_id"]))
+        result_url = generate_image_media(job, settings) if job["kind"] == "image" else generate_video_media(job, settings)
+    except ProviderError as error:
+        detail = str(error)[:500]
+    except Exception:
+        LOGGER.exception("Media job %s failed unexpectedly", job["id"])
+        detail = "The media job failed unexpectedly. Check the worker logs."
+    else:
+        with db() as connection:
+            connection.execute("UPDATE media_jobs SET status = 'succeeded', progress = 100, result_url = ?, error = NULL, updated_at = ? WHERE id = ?", (result_url, now(), job["id"]))
+        return
+    with db() as connection:
+        connection.execute("UPDATE media_jobs SET status = 'failed', error = ?, updated_at = ? WHERE id = ?", (detail, now(), job["id"]))
+        record_usage(connection, int(job["workspace_id"]), "ai_media", -1)
+
+
+def media_worker() -> None:
+    """Process queued media jobs without blocking scheduled post delivery."""
+    while True:
+        try:
+            job = claim_media_job()
+            if job is not None:
+                run_media_job(dict(job))
+                continue
+        except Exception:
+            LOGGER.exception("Media job poll failed")
+        time.sleep(POLL_SECONDS)
 
 
 def audit(user_id: int | None, action: str, subject_type: str, subject_id: object | None, detail: str, source_ip: str, workspace_id: int | None = None) -> None:
@@ -1710,6 +1875,7 @@ def deliver(post_id: int) -> None:
 
 
 def scheduler() -> None:
+    threading.Thread(target=media_worker, daemon=True, name="media-worker").start()
     last_token_refresh = 0.0
     while True:
         try:
@@ -2111,6 +2277,35 @@ class Handler(SimpleHTTPRequestHandler):
                 record["health"] = connection_health(record)
             self._json({"connections": records})
             return
+        if path == "/api/media/jobs":
+            session = self._session()
+            workspace_id = self._require_workspace(session)
+            if workspace_id is None:
+                return
+            reviewer = workspace_role_allows(session["workspace_role"], "admin")
+            with db() as connection:
+                jobs = [dict(row) for row in connection.execute(
+                    "SELECT media_jobs.id, media_jobs.kind, media_jobs.prompt, media_jobs.aspect_ratio, media_jobs.style, media_jobs.provider, media_jobs.model, media_jobs.status, media_jobs.progress, media_jobs.error, media_jobs.result_url, media_jobs.moderation, media_jobs.created_at, users.username AS created_by"
+                    " FROM media_jobs JOIN users ON users.id = media_jobs.user_id WHERE media_jobs.workspace_id = ? ORDER BY media_jobs.id DESC LIMIT 100",
+                    (workspace_id,),
+                ).fetchall()]
+            for job in jobs:
+                if job["moderation"] != "approved" and not reviewer:
+                    job["result_url"] = None
+            self._json({"jobs": jobs})
+            return
+        if path == "/api/media/library":
+            session = self._session()
+            workspace_id = self._require_workspace(session)
+            if workspace_id is None:
+                return
+            with db() as connection:
+                assets = [dict(row) for row in connection.execute(
+                    "SELECT id, kind, prompt, aspect_ratio, result_url, created_at FROM media_jobs WHERE workspace_id = ? AND status = 'succeeded' AND moderation = 'approved' ORDER BY id DESC LIMIT 200",
+                    (workspace_id,),
+                ).fetchall()]
+            self._json({"assets": assets})
+            return
         if path == "/api/workspaces/export":
             session = self._session()
             workspace_id = self._require_workspace(session, "admin")
@@ -2191,7 +2386,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             upload = UPLOADS_DIR / filename
             self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", next((kind for kind, suffix in IMAGE_TYPES.items() if suffix == upload.suffix), "application/octet-stream"))
+            self.send_header("Content-Type", next((kind for kind, suffix in {**IMAGE_TYPES, "video/mp4": ".mp4"}.items() if suffix == upload.suffix), "application/octet-stream"))
             self.send_header("Content-Length", str(upload.stat().st_size))
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -2490,6 +2685,55 @@ class Handler(SimpleHTTPRequestHandler):
                     connection.execute("DELETE FROM workspace_memberships WHERE id = ?", (membership["id"],))
                 audit(session["user_id"], "workspace.member_removed", "user", member_user_id, "Removed workspace member", self._source_ip(), workspace_id=workspace_id)
                 self._json({"status": "removed"}); return
+            if path == "/api/media/jobs":
+                workspace_id = self._require_workspace(session, "editor")
+                if workspace_id is None:
+                    return
+                kind = str(payload.get("kind", "image")).strip()
+                prompt = str(payload.get("prompt", "")).strip()
+                aspect = str(payload.get("aspect_ratio", "1:1")).strip()
+                style = str(payload.get("style", "")).strip()
+                provider = str(payload.get("provider", "")).strip()
+                model = str(payload.get("model", "")).strip()
+                if kind not in MEDIA_JOB_KINDS:
+                    self._json({"error": "Choose image or video generation."}, HTTPStatus.BAD_REQUEST); return
+                if not prompt or len(prompt) > MAX_MEDIA_PROMPT_LENGTH or len(style) > MAX_MEDIA_STYLE_LENGTH or len(model) > 200:
+                    self._json({"error": f"Provide a prompt up to {MAX_MEDIA_PROMPT_LENGTH} characters and a style up to {MAX_MEDIA_STYLE_LENGTH}."}, HTTPStatus.BAD_REQUEST); return
+                sizes = MEDIA_IMAGE_SIZES if kind == "image" else MEDIA_VIDEO_SIZES
+                if aspect not in sizes:
+                    self._json({"error": f"Choose an aspect ratio from: {', '.join(sizes)}."}, HTTPStatus.BAD_REQUEST); return
+                if not provider:
+                    configured = available_ai_providers(workspace_id)
+                    provider = configured[0]["name"] if configured else ""
+                try:
+                    ai_provider_settings(provider, workspace_id)
+                except ProviderError as error:
+                    self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST); return
+                if not model and not default_media_model(provider, kind):
+                    self._json({"error": f"{provider} has no supported {kind} model in Sosopo. Choose another provider or set a model explicitly."}, HTTPStatus.BAD_REQUEST); return
+                with db() as connection:
+                    enforce_monthly_quota(connection, workspace_id, "ai_media", "ai_media_per_month", "AI media generations")
+                    record_usage(connection, workspace_id, "ai_media")
+                    job_id = insert_id(connection,
+                        "INSERT INTO media_jobs (workspace_id, user_id, kind, prompt, aspect_ratio, style, provider, model, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
+                        (workspace_id, session["user_id"], kind, prompt, aspect, style, provider, model, now(), now()),
+                    )
+                audit(session["user_id"], "media.job_created", "media_job", job_id, f"Queued {kind} generation with {provider}", self._source_ip(), workspace_id=workspace_id)
+                self._json({"id": job_id, "status": "queued", "provider": provider}, HTTPStatus.CREATED); return
+            if path.startswith("/api/media/jobs/") and path.endswith("/review"):
+                workspace_id = self._require_workspace(session, "admin")
+                if workspace_id is None:
+                    return
+                job_id = int(path.split("/")[4])
+                decision = str(payload.get("decision", "")).strip()
+                if decision not in {"approved", "rejected"}:
+                    self._json({"error": "Choose approved or rejected."}, HTTPStatus.BAD_REQUEST); return
+                with db() as connection:
+                    changed = connection.execute("UPDATE media_jobs SET moderation = ?, reviewed_by = ?, updated_at = ? WHERE id = ? AND workspace_id = ? AND status = 'succeeded'", (decision, session["user_id"], now(), job_id, workspace_id))
+                if changed.rowcount != 1:
+                    self._json({"error": "Only this workspace's finished media jobs can be reviewed."}, HTTPStatus.NOT_FOUND); return
+                audit(session["user_id"], "media.reviewed", "media_job", job_id, f"Marked generated media {decision}", self._source_ip(), workspace_id=workspace_id)
+                self._json({"id": job_id, "moderation": decision}); return
             if path == "/api/workspaces/ai-providers":
                 workspace_id = self._require_workspace(session, "admin")
                 if workspace_id is None:
@@ -2766,6 +3010,10 @@ class Handler(SimpleHTTPRequestHandler):
                             self._json({"error": "Select active accounts for every chosen platform."}, HTTPStatus.BAD_REQUEST); return
                     elif len(channels) != 1:
                         self._json({"error": "Connect an account for each platform when publishing to more than one platform."}, HTTPStatus.BAD_REQUEST); return
+                    for url in image_urls:
+                        generated = connection.execute("SELECT workspace_id, moderation FROM media_jobs WHERE result_url = ?", (url,)).fetchone()
+                        if generated and (generated["workspace_id"] != workspace_id or generated["moderation"] != "approved"):
+                            self._json({"error": "Generated media must be approved in this workspace before it can be published."}, HTTPStatus.BAD_REQUEST); return
                     for channel in channels:
                         validate_post(channel, body, image_url, len(image_urls))
                     enforce_monthly_quota(connection, workspace_id, "posts_created", "posts_per_month", "posts")
