@@ -518,9 +518,15 @@ def ai_provider_models(provider: str) -> list[str]:
         settings = {"name": provider, "api_key": stored.get("api_key") or config(f"{definition[1]}_API_KEY"), "base_url": definition[2]}
     else:
         settings = ai_provider_settings(provider)
-    # A unique query string bypasses intermediary caches while keeping the
-    # provider's documented models endpoint. Sosopo itself never caches this.
-    model_list_url = f"{settings['base_url']}/models?refresh={int(time.time())}"
+    # MiniMax documents this exact endpoint for Token Plan keys.  In
+    # particular, do not append cache-busting query parameters: some MiniMax
+    # API gateways reject an otherwise valid signed/bearer request when the
+    # request URI differs from the documented endpoint.
+    model_list_url = f"{settings['base_url']}/models"
+    if provider != "MiniMax":
+        # A unique query string bypasses intermediary caches for providers
+        # which accept it. Sosopo itself never caches this response.
+        model_list_url = f"{model_list_url}?refresh={int(time.time())}"
     headers = {"Authorization": f"Bearer {settings['api_key']}"} if settings.get("api_key") else None
     result = request_get_json(model_list_url, headers)
     entries = result.get("data") or result.get("models") or []
@@ -1588,16 +1594,20 @@ class Handler(SimpleHTTPRequestHandler):
                 definition = AI_PROVIDERS.get(provider)
                 if definition is None:
                     self._json({"error": "Choose a supported AI provider."}, HTTPStatus.BAD_REQUEST); return
-                model = str(payload.get("model", "")).strip()
-                api_key = str(payload.get("api_key", "")).strip()
-                if not model or len(model) > 200:
-                    self._json({"error": "Choose a model."}, HTTPStatus.BAD_REQUEST); return
                 current = stored_ai_provider_settings(provider)
+                model = str(payload.get("model", "")).strip() or current.get("model") or AI_PROVIDER_MODELS[provider][0]
+                api_key = str(payload.get("api_key", "")).strip()
+                if len(model) > 200:
+                    self._json({"error": "Choose a model."}, HTTPStatus.BAD_REQUEST); return
                 if not api_key and not current.get("api_key"):
                     self._json({"error": "Provide an API key for this provider."}, HTTPStatus.BAD_REQUEST); return
                 catalog = ai_model_catalog(current) or AI_PROVIDER_MODELS[provider]
+                # The browser normally supplies a model from this catalog. Do
+                # not make saving a credential depend on a prior live catalog
+                # refresh, though: provider catalogs can be temporarily
+                # unavailable, and the selected default may be newly released.
                 if model not in catalog:
-                    self._json({"error": "Choose a model from the provider list."}, HTTPStatus.BAD_REQUEST); return
+                    catalog = [model, *catalog]
                 stored = {"api_key": api_key or current["api_key"], "base_url": definition[2], "model": model, "models": json.dumps(catalog)}
                 if current.get("models_checked_at"):
                     stored["models_checked_at"] = current["models_checked_at"]

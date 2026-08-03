@@ -78,6 +78,8 @@ Sosopo can generate draft post copy inside the composer. An administrator config
 
 Each provider starts with a maintained set of sensible text-model choices. OpenAI includes the GPT-5.6 Sol/Terra/Luna and GPT-5.5 entries requested by the workspace; Kimi includes K3, K2.7 Code, and K2.6; MiniMax includes M3 and current M2 variants. After saving, use **Refresh model list** to load and save the provider's account-visible catalog. OpenRouter’s public catalog can be refreshed before saving a key. The composer uses the first configured provider and its selected default model, so collaborators never need to manage provider credentials or model IDs.
 
+For **MiniMax Token Plan**, paste the Token Plan API key from the MiniMax console into the MiniMax provider entry and save it. Sosopo selects `MiniMax-M2.7` by default, so saving does not require a successful model refresh. Refreshing later calls MiniMax’s documented `https://api.minimax.io/v1/models` endpoint with that bearer token; it updates the dropdown only when MiniMax makes the catalog available to the key.
+
 Environment variables remain supported as an optional deployment/migration fallback, but users do not need to edit `.env` when the administrator configures providers in the UI.
 
 ```env

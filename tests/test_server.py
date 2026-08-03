@@ -142,7 +142,7 @@ class SosopoTest(unittest.TestCase):
         s.request_get_json = lambda url, headers=None: calls.append(url) or {"data": [{"id": "MiniMax-M2.8"}]}
         try:
             self.assertEqual(s.ai_provider_models("MiniMax"), ["MiniMax-M2.8"])
-            self.assertTrue(calls[0].startswith("https://api.minimax.io/v1/models?refresh="))
+            self.assertEqual(calls[0], "https://api.minimax.io/v1/models")
         finally:
             s.request_get_json = original_request_get_json
 
