@@ -4,19 +4,19 @@ This roadmap describes the work required to evolve Sosopo from its current
 single-instance, per-user publishing application into a self-hosted and hosted
 multi-workspace platform.
 
-## Phase 1 — Workspaces and memberships
+## Phase 1 — Workspaces and memberships (complete)
 
-- [ ] Add `workspaces`: name, slug, owner, plan, status, and timestamps.
-- [ ] Add `workspace_memberships`: user, workspace, role, invite state, and timestamps.
-- [ ] Support `owner`, `admin`, `editor`, and `viewer` roles.
-- [ ] Add an active-workspace selector to the portal.
-- [ ] Migrate existing posts, media, connections, AI settings, and relevant audit records to workspace ownership.
-- [ ] Keep a safe default workspace for existing installations during migration.
-- [ ] Allow one user to belong to multiple workspaces.
-- [ ] Scope every server-side query and action to membership in the active workspace.
-- [ ] Make channels/connections available to authorized workspace members.
-- [ ] Make posts and media workspace-owned while retaining the author for audit history.
-- [ ] Add tenant-isolation and role-permission tests.
+- [x] Add `workspaces`: name, slug, owner, plan, status, and timestamps.
+- [x] Add `workspace_memberships`: user, workspace, role, invite state, and timestamps.
+- [x] Support `owner`, `admin`, `editor`, and `viewer` roles.
+- [x] Add an active-workspace selector to the portal.
+- [x] Migrate existing posts, media, connections, and relevant audit records to workspace ownership. AI provider settings deliberately stay instance-wide until Phase 4 moves them to workspace-level configuration.
+- [x] Keep a safe default workspace for existing installations during migration: every existing user receives an isolated personal workspace, so no historical data becomes visible to another user.
+- [x] Allow one user to belong to multiple workspaces.
+- [x] Scope every server-side query and action to membership in the active workspace.
+- [x] Make channels/connections available to authorized workspace members.
+- [x] Make posts and media workspace-owned while retaining the author for audit history.
+- [x] Add tenant-isolation and role-permission tests.
 
 ## Phase 2 — Invitations and identity
 

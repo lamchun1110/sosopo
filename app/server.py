@@ -71,6 +71,9 @@ CHANNELS = ("Facebook", "Instagram", "Threads", "X", "Telegram", "Discord", "Lin
 IMAGE_TYPES = {"image/gif": ".gif", "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 CHANNEL_CHARACTER_LIMITS = {"Facebook": 5_000, "Instagram": 2_200, "Threads": 500, "X": 280, "Telegram": 4_096, "Discord": 2_000, "LinkedIn": 3_000}
 CHANNEL_MEDIA_LIMITS = {"Facebook": 10, "Instagram": 10, "Threads": 10, "X": 4, "Telegram": 10, "Discord": 10, "LinkedIn": 0}
+WORKSPACE_ROLES = ("owner", "admin", "editor", "viewer")
+WORKSPACE_ROLE_RANK = {"viewer": 0, "editor": 1, "admin": 2, "owner": 3}
+MAX_WORKSPACE_NAME_LENGTH = 80
 LOGGER = logging.getLogger("sosopo")
 RATE_LIMITS: dict[tuple[str, str], list[float]] = {}
 RATE_LIMIT_LOCK = threading.Lock()
@@ -414,6 +417,41 @@ def setup_database() -> None:
                 value TEXT NOT NULL
             )"""
         )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS workspaces (
+                id %s,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL UNIQUE,
+                owner_user_id INTEGER NOT NULL,
+                plan TEXT NOT NULL DEFAULT 'self_hosted',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(owner_user_id) REFERENCES users(id)
+            )""" % id_column
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS workspace_memberships (
+                id %s,
+                workspace_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT 'editor',
+                invite_state TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(workspace_id, user_id),
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(id),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )""" % id_column
+        )
+        add_column(connection, "workspace_id", "INTEGER")
+        add_table_column(connection, "connections", "workspace_id", "INTEGER")
+        add_table_column(connection, "sessions", "active_workspace_id", "INTEGER")
+        add_table_column(connection, "social_oauth_states", "workspace_id", "INTEGER")
+        add_table_column(connection, "audit_events", "workspace_id", "INTEGER")
+        connection.execute("CREATE INDEX IF NOT EXISTS posts_workspace ON posts(workspace_id, state)")
+        connection.execute("CREATE INDEX IF NOT EXISTS connections_workspace ON connections(workspace_id, provider)")
+        connection.execute("CREATE INDEX IF NOT EXISTS workspace_memberships_user ON workspace_memberships(user_id)")
         connection.execute("CREATE INDEX IF NOT EXISTS posts_due_delivery ON posts(state, scheduled_for)")
         connection.execute("CREATE INDEX IF NOT EXISTS post_media_post ON post_media(post_id, position)")
         connection.execute("CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at)")
@@ -424,6 +462,83 @@ def setup_database() -> None:
                 "INSERT INTO posts (body, channel, state, created_at) VALUES (?, ?, 'draft', ?)",
                 ("Welcome to Sosopo. Configure a provider when you are ready to publish.", "Facebook", now()),
             )
+        migrate_users_to_workspaces(connection)
+
+
+def workspace_role_allows(role: object, minimum: str) -> bool:
+    return WORKSPACE_ROLE_RANK.get(str(role or ""), -1) >= WORKSPACE_ROLE_RANK[minimum]
+
+
+def workspace_slug(connection: Database, name: str) -> str:
+    base = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-")[:40] or "workspace"
+    slug, counter = base, 1
+    while connection.execute("SELECT 1 FROM workspaces WHERE slug = ?", (slug,)).fetchone():
+        counter += 1
+        slug = f"{base}-{counter}"
+    return slug
+
+
+def create_workspace(connection: Database, name: str, owner_user_id: int) -> int:
+    workspace_id = insert_id(
+        connection,
+        "INSERT INTO workspaces (name, slug, owner_user_id, plan, status, created_at, updated_at) VALUES (?, ?, ?, 'self_hosted', 'active', ?, ?)",
+        (name, workspace_slug(connection, name), owner_user_id, now(), now()),
+    )
+    connection.execute(
+        "INSERT INTO workspace_memberships (workspace_id, user_id, role, invite_state, created_at, updated_at) VALUES (?, ?, 'owner', 'active', ?, ?)",
+        (workspace_id, owner_user_id, now(), now()),
+    )
+    return workspace_id
+
+
+def workspace_membership(connection: Database, workspace_id: int, user_id: int) -> Record | None:
+    return connection.execute(
+        "SELECT workspace_memberships.*, workspaces.name AS workspace_name, workspaces.slug AS workspace_slug"
+        " FROM workspace_memberships JOIN workspaces ON workspaces.id = workspace_memberships.workspace_id AND workspaces.status = 'active'"
+        " WHERE workspace_memberships.workspace_id = ? AND workspace_memberships.user_id = ? AND workspace_memberships.invite_state = 'active'",
+        (workspace_id, user_id),
+    ).fetchone()
+
+
+def user_workspaces(connection: Database, user_id: int) -> list[Record]:
+    return connection.execute(
+        "SELECT workspaces.id, workspaces.name, workspaces.slug, workspaces.owner_user_id, workspace_memberships.role"
+        " FROM workspace_memberships JOIN workspaces ON workspaces.id = workspace_memberships.workspace_id AND workspaces.status = 'active'"
+        " WHERE workspace_memberships.user_id = ? AND workspace_memberships.invite_state = 'active' ORDER BY workspace_memberships.id",
+        (user_id,),
+    ).fetchall()
+
+
+def default_workspace_id(connection: Database, user_id: int) -> int | None:
+    workspaces = user_workspaces(connection, user_id)
+    return int(workspaces[0]["id"]) if workspaces else None
+
+
+def ensure_personal_workspace(connection: Database, user_id: int, username: str) -> int:
+    """Give a user one personal workspace and adopt their pre-workspace data into it."""
+    existing = default_workspace_id(connection, user_id)
+    if existing is not None:
+        return existing
+    workspace_id = create_workspace(connection, f"{username}'s workspace", user_id)
+    connection.execute("UPDATE posts SET workspace_id = ? WHERE user_id = ? AND workspace_id IS NULL", (workspace_id, user_id))
+    connection.execute("UPDATE connections SET workspace_id = ? WHERE user_id = ? AND workspace_id IS NULL", (workspace_id, user_id))
+    connection.execute("UPDATE audit_events SET workspace_id = ? WHERE user_id = ? AND workspace_id IS NULL", (workspace_id, user_id))
+    return workspace_id
+
+
+def migrate_users_to_workspaces(connection: Database) -> None:
+    """Give every pre-workspace user an isolated personal workspace.
+
+    Existing installations may hold several users whose posts and connections
+    were private to each user. One workspace per user preserves exactly that
+    isolation; merging everyone into a shared workspace would leak data.
+    """
+    users = connection.execute(
+        "SELECT users.id, users.username FROM users LEFT JOIN workspace_memberships ON workspace_memberships.user_id = users.id"
+        " WHERE workspace_memberships.id IS NULL ORDER BY users.id"
+    ).fetchall()
+    for user in users:
+        ensure_personal_workspace(connection, int(user["id"]), str(user["username"]))
 
 
 def config(name: str) -> str:
@@ -576,11 +691,11 @@ def generate_post_copy(provider: str, model: str, instruction: str, draft: str, 
     return content.strip()
 
 
-def audit(user_id: int | None, action: str, subject_type: str, subject_id: object | None, detail: str, source_ip: str) -> None:
+def audit(user_id: int | None, action: str, subject_type: str, subject_id: object | None, detail: str, source_ip: str, workspace_id: int | None = None) -> None:
     with db() as connection:
         connection.execute(
-            "INSERT INTO audit_events (user_id, action, subject_type, subject_id, detail, source_ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (user_id, action, subject_type, str(subject_id) if subject_id is not None else None, detail[:500], source_ip[:100], now()),
+            "INSERT INTO audit_events (user_id, workspace_id, action, subject_type, subject_id, detail, source_ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, workspace_id, action, subject_type, str(subject_id) if subject_id is not None else None, detail[:500], source_ip[:100], now()),
         )
 
 
@@ -774,17 +889,22 @@ def social_oauth_connections(provider: str, settings: dict[str, str], code: str,
     return [{"provider": "X", "external_account_id": str(profile["id"]), "display_name": str(profile.get("username") or profile.get("name") or profile["id"]), "access_token": access_token, "token_expires_at": expiry or ""}]
 
 
-def save_social_connections(user_id: int, records: list[dict[str, str]]) -> int:
+def save_social_connections(user_id: int, workspace_id: int, records: list[dict[str, str]]) -> int:
     saved = 0
     with db() as connection:
+        if workspace_membership(connection, workspace_id, user_id) is None:
+            raise ProviderError("You are no longer a member of the workspace this connection was started for.", retryable=False)
         for record in records:
-            existing = connection.execute("SELECT id FROM connections WHERE user_id = ? AND provider = ? AND external_account_id = ?", (user_id, record["provider"], record["external_account_id"])).fetchone()
+            existing = connection.execute("SELECT id FROM connections WHERE workspace_id = ? AND provider = ? AND external_account_id = ?", (workspace_id, record["provider"], record["external_account_id"])).fetchone()
             encrypted = encrypt_secrets({str(record.get("secret_name") or "access_token"): record["access_token"]})
             expiry = record["token_expires_at"] or None
             if existing:
                 connection.execute("UPDATE connections SET display_name = ?, encrypted_secrets = ?, token_expires_at = ?, is_active = 1 WHERE id = ?", (record["display_name"], encrypted, expiry, existing["id"]))
             else:
-                connection.execute("INSERT INTO connections (user_id, provider, external_account_id, display_name, encrypted_secrets, settings_json, token_expires_at, created_at) VALUES (?, ?, ?, ?, ?, '{}', ?, ?)", (user_id, record["provider"], record["external_account_id"], record["display_name"], encrypted, expiry, now()))
+                conflicting = connection.execute("SELECT id FROM connections WHERE user_id = ? AND provider = ? AND external_account_id = ?", (user_id, record["provider"], record["external_account_id"])).fetchone()
+                if conflicting:
+                    raise ProviderError(f"The {record['provider']} account {record['display_name']} is already connected in another of your workspaces.", retryable=False)
+                connection.execute("INSERT INTO connections (user_id, workspace_id, provider, external_account_id, display_name, encrypted_secrets, settings_json, token_expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?)", (user_id, workspace_id, record["provider"], record["external_account_id"], record["display_name"], encrypted, expiry, now()))
             saved += 1
     return saved
 
@@ -1242,17 +1362,42 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'")
         super().end_headers()
 
-    def _session(self) -> sqlite3.Row | None:
+    SESSION_QUERY = (
+        "SELECT sessions.*, users.username, users.role, users.timezone, users.signature,"
+        " workspaces.id AS workspace_id, workspaces.name AS workspace_name, workspaces.slug AS workspace_slug,"
+        " workspace_memberships.role AS workspace_role"
+        " FROM sessions JOIN users ON users.id = sessions.user_id"
+        " LEFT JOIN workspace_memberships ON workspace_memberships.workspace_id = sessions.active_workspace_id"
+        " AND workspace_memberships.user_id = sessions.user_id AND workspace_memberships.invite_state = 'active'"
+        " LEFT JOIN workspaces ON workspaces.id = workspace_memberships.workspace_id AND workspaces.status = 'active'"
+        " WHERE sessions.token_hash = ? AND sessions.expires_at > ? AND users.is_active = 1"
+    )
+
+    def _session(self) -> Record | None:
         cookie = SimpleCookie(self.headers.get("Cookie"))
         token = cookie.get("sosopo_session")
         if token is None:
             return None
         token_hash = hashlib.sha256(token.value.encode()).hexdigest()
         with db() as connection:
-            return connection.execute(
-                "SELECT sessions.*, users.username, users.role, users.timezone, users.signature FROM sessions JOIN users ON users.id = sessions.user_id WHERE token_hash = ? AND expires_at > ? AND users.is_active = 1",
-                (token_hash, now()),
-            ).fetchone()
+            session = connection.execute(self.SESSION_QUERY, (token_hash, now())).fetchone()
+            if session is not None and session["workspace_id"] is None:
+                # The active workspace vanished or the membership was revoked:
+                # fall back to the user's first remaining workspace.
+                fallback = default_workspace_id(connection, session["user_id"])
+                if fallback is not None and fallback != session["active_workspace_id"]:
+                    connection.execute("UPDATE sessions SET active_workspace_id = ? WHERE id = ?", (fallback, session["id"]))
+                    session = connection.execute(self.SESSION_QUERY, (token_hash, now())).fetchone()
+        return session
+
+    def _require_workspace(self, session: Record, minimum_role: str = "viewer") -> int | None:
+        if not session.get("workspace_id") or not session.get("workspace_role"):
+            self._json({"error": "Join an active workspace to use this feature."}, HTTPStatus.FORBIDDEN)
+            return None
+        if not workspace_role_allows(session["workspace_role"], minimum_role):
+            self._json({"error": f"This action needs the workspace {minimum_role} role or higher."}, HTTPStatus.FORBIDDEN)
+            return None
+        return int(session["workspace_id"])
 
     def _require_auth(self, csrf: bool = False) -> sqlite3.Row | None:
         session = self._session()
@@ -1278,8 +1423,8 @@ class Handler(SimpleHTTPRequestHandler):
         with db() as connection:
             connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (now(),))
             connection.execute(
-                "INSERT INTO sessions (token_hash, csrf_token, user_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
-                (hashlib.sha256(token.encode()).hexdigest(), csrf_token, user_id, expires_at(), now()),
+                "INSERT INTO sessions (token_hash, csrf_token, user_id, active_workspace_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (hashlib.sha256(token.encode()).hexdigest(), csrf_token, user_id, default_workspace_id(connection, user_id), expires_at(), now()),
             )
         return {"token": token, "csrf_token": csrf_token}
 
@@ -1356,7 +1501,10 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/session":
             session = self._require_auth()
             if session:
-                self._json({"username": session["username"], "role": session["role"], "timezone": session["timezone"], "signature": session["signature"], "csrf_token": session["csrf_token"]})
+                with db() as connection:
+                    workspaces = [{"id": item["id"], "name": item["name"], "slug": item["slug"], "role": item["role"], "is_owner": item["owner_user_id"] == session["user_id"]} for item in user_workspaces(connection, session["user_id"])]
+                workspace = {"id": session["workspace_id"], "name": session["workspace_name"], "slug": session["workspace_slug"], "role": session["workspace_role"]} if session.get("workspace_id") else None
+                self._json({"username": session["username"], "role": session["role"], "timezone": session["timezone"], "signature": session["signature"], "workspace": workspace, "workspaces": workspaces, "csrf_token": session["csrf_token"]})
             return
         if path == "/api/auth/oidc/login":
             try:
@@ -1397,6 +1545,7 @@ class Handler(SimpleHTTPRequestHandler):
                         self._json({"error": "Your SSO account has not been provisioned."}, HTTPStatus.FORBIDDEN); return
                     salt = secrets.token_bytes(16)
                     user_id = insert_id(connection, "INSERT INTO users (username, password_salt, password_hash, role, timezone, oidc_issuer, oidc_subject, created_at) VALUES (?, ?, ?, 'user', 'UTC', ?, ?, ?)", (username, salt.hex(), hash_password(secrets.token_urlsafe(32), salt), settings["issuer"], subject, now()))
+                    ensure_personal_workspace(connection, user_id, username)
                     user = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
                 elif not user["is_active"]:
                     self._json({"error": "This user account is disabled."}, HTTPStatus.FORBIDDEN); return
@@ -1412,9 +1561,17 @@ class Handler(SimpleHTTPRequestHandler):
             if stored is None:
                 self._json({"error": "Expired or invalid social account connection state."}, HTTPStatus.BAD_REQUEST); return
             try:
+                workspace_id = stored["workspace_id"]
+                if workspace_id is None:
+                    # A state row created before the workspace upgrade: use the
+                    # connecting user's default workspace.
+                    with db() as connection:
+                        workspace_id = default_workspace_id(connection, stored["user_id"])
+                if workspace_id is None:
+                    self._json({"error": "Join an active workspace before connecting accounts."}, HTTPStatus.FORBIDDEN); return
                 records = social_oauth_connections(provider, social_oauth_settings(provider), code, stored["code_verifier"])
-                saved = save_social_connections(stored["user_id"], records)
-                audit(stored["user_id"], "connection.oauth_connected", "connection", None, f"Connected {saved} account(s) through {provider} OAuth", self._source_ip())
+                saved = save_social_connections(stored["user_id"], int(workspace_id), records)
+                audit(stored["user_id"], "connection.oauth_connected", "connection", None, f"Connected {saved} account(s) through {provider} OAuth", self._source_ip(), workspace_id=int(workspace_id))
                 self.send_response(HTTPStatus.FOUND); self.send_header("Location", "/?connected=" + urlencode({"provider": provider, "accounts": saved})); self.end_headers()
             except ProviderError as error:
                 self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
@@ -1436,11 +1593,15 @@ class Handler(SimpleHTTPRequestHandler):
             if provider not in {"Facebook", "Threads", "X", "LinkedIn", "Discord"}:
                 self._json({"error": "Unsupported social OAuth provider."}, HTTPStatus.NOT_FOUND); return
             try:
-                session, settings = self._session(), social_oauth_settings(provider)
+                session = self._session()
+                workspace_id = self._require_workspace(session, "admin")
+                if workspace_id is None:
+                    return
+                settings = social_oauth_settings(provider)
                 state, verifier = secrets.token_urlsafe(32), secrets.token_urlsafe(64)
                 with db() as connection:
                     connection.execute("DELETE FROM social_oauth_states WHERE expires_at <= ?", (now(),))
-                    connection.execute("INSERT INTO social_oauth_states (state, provider, user_id, code_verifier, expires_at) VALUES (?, ?, ?, ?, ?)", (state, provider, session["user_id"], verifier if provider == "X" else None, (datetime.now(UTC) + timedelta(seconds=SOCIAL_OAUTH_STATE_SECONDS)).isoformat()))
+                    connection.execute("INSERT INTO social_oauth_states (state, provider, user_id, workspace_id, code_verifier, expires_at) VALUES (?, ?, ?, ?, ?, ?)", (state, provider, session["user_id"], workspace_id, verifier if provider == "X" else None, (datetime.now(UTC) + timedelta(seconds=SOCIAL_OAUTH_STATE_SECONDS)).isoformat()))
                 query = {"client_id": settings["client_id"], "redirect_uri": social_oauth_redirect_uri(), "response_type": "code", "scope": settings["scopes"], "state": state}
                 if provider == "X":
                     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
@@ -1451,8 +1612,11 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/dashboard":
             session = self._session()
+            workspace_id = self._require_workspace(session)
+            if workspace_id is None:
+                return
             with db() as connection:
-                posts = [dict(row) for row in connection.execute("SELECT * FROM posts WHERE user_id = ? ORDER BY CASE state WHEN 'scheduled' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, scheduled_for, id DESC", (session["user_id"],)).fetchall()]
+                posts = [dict(row) for row in connection.execute("SELECT * FROM posts WHERE workspace_id = ? ORDER BY CASE state WHEN 'scheduled' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, scheduled_for, id DESC", (workspace_id,)).fetchall()]
                 for post in posts:
                     post["media_urls"] = [row["media_url"] for row in connection.execute("SELECT media_url FROM post_media WHERE post_id = ? ORDER BY position", (post["id"],)).fetchall()] or ([post["image_url"]] if post.get("image_url") else [])
             self._json({"posts": posts, "providers": [{"name": channel, "status": provider_status(channel), "oauth_available": social_oauth_enabled(channel)} for channel in CHANNELS]})
@@ -1507,9 +1671,31 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path == "/api/connections":
             session = self._session()
+            workspace_id = self._require_workspace(session)
+            if workspace_id is None:
+                return
             with db() as connection:
-                records = [dict(row) for row in connection.execute("SELECT id, provider, external_account_id, display_name, token_expires_at, is_active, created_at FROM connections WHERE user_id = ? ORDER BY provider, display_name", (session["user_id"],)).fetchall()]
+                records = [dict(row) for row in connection.execute("SELECT id, provider, external_account_id, display_name, token_expires_at, is_active, created_at FROM connections WHERE workspace_id = ? ORDER BY provider, display_name", (workspace_id,)).fetchall()]
             self._json({"connections": records})
+            return
+        if path == "/api/workspaces":
+            session = self._session()
+            with db() as connection:
+                workspaces = [{"id": item["id"], "name": item["name"], "slug": item["slug"], "role": item["role"], "is_owner": item["owner_user_id"] == session["user_id"]} for item in user_workspaces(connection, session["user_id"])]
+            self._json({"workspaces": workspaces, "active_workspace_id": session.get("workspace_id")})
+            return
+        if path == "/api/workspaces/members":
+            session = self._session()
+            workspace_id = self._require_workspace(session, "admin")
+            if workspace_id is None:
+                return
+            with db() as connection:
+                members = [dict(row) for row in connection.execute(
+                    "SELECT workspace_memberships.user_id, workspace_memberships.role, workspace_memberships.invite_state, workspace_memberships.created_at, users.username, users.is_active"
+                    " FROM workspace_memberships JOIN users ON users.id = workspace_memberships.user_id WHERE workspace_memberships.workspace_id = ? ORDER BY workspace_memberships.id",
+                    (workspace_id,),
+                ).fetchall()]
+            self._json({"members": members})
             return
         if path.startswith("/api/posts/") and path.endswith("/deliveries"):
             try:
@@ -1517,8 +1703,11 @@ class Handler(SimpleHTTPRequestHandler):
             except ValueError:
                 self._json({"error": "Invalid post ID."}, HTTPStatus.BAD_REQUEST); return
             session = self._session()
+            workspace_id = self._require_workspace(session)
+            if workspace_id is None:
+                return
             with db() as connection:
-                owner = connection.execute("SELECT id FROM posts WHERE id = ? AND user_id = ?", (post_id, session["user_id"])).fetchone()
+                owner = connection.execute("SELECT id FROM posts WHERE id = ? AND workspace_id = ?", (post_id, workspace_id)).fetchone()
                 if owner is None:
                     self._json({"error": "Post not found."}, HTTPStatus.NOT_FOUND); return
                 deliveries = [dict(row) for row in connection.execute("SELECT provider, status, detail, created_at FROM deliveries WHERE post_id = ? ORDER BY id DESC", (post_id,)).fetchall()]
@@ -1574,7 +1763,8 @@ class Handler(SimpleHTTPRequestHandler):
                         self._json({"error": "Setup has already been completed."}, HTTPStatus.CONFLICT); return
                     salt = secrets.token_bytes(16)
                     user_id = insert_id(connection, "INSERT INTO users (username, password_salt, password_hash, role, timezone, created_at) VALUES (?, ?, ?, ?, 'UTC', ?)", (username, salt.hex(), hash_password(password, salt), "admin", now()))
-                    connection.execute("UPDATE posts SET user_id = ? WHERE user_id IS NULL", (user_id,))
+                    workspace_id = ensure_personal_workspace(connection, user_id, username)
+                    connection.execute("UPDATE posts SET user_id = ?, workspace_id = ? WHERE user_id IS NULL", (user_id, workspace_id))
                 audit(user_id, "setup.completed", "user", user_id, "Created initial administrator", self._source_ip())
                 self._json_session({"username": username}, self._create_session(user_id), HTTPStatus.CREATED); return
             if path == "/api/login":
@@ -1633,6 +1823,9 @@ class Handler(SimpleHTTPRequestHandler):
                 audit(session["user_id"], "ai_provider.removed", "instance", provider, f"Removed {provider} UI-saved API key", self._source_ip())
                 self._json({"status": "removed" if removed else "not configured", "name": provider}); return
             if path == "/api/ai/generate":
+                workspace_id = self._require_workspace(session, "editor")
+                if workspace_id is None:
+                    return
                 provider = str(payload.get("provider", ""))
                 model = str(payload.get("model", ""))
                 instruction = str(payload.get("instruction", ""))
@@ -1644,7 +1837,7 @@ class Handler(SimpleHTTPRequestHandler):
                     copy = generate_post_copy(provider, model, instruction, draft, [str(channel) for channel in channels])
                 except ProviderError as error:
                     self._json({"error": str(error)}, HTTPStatus.BAD_GATEWAY); return
-                audit(session["user_id"], "post.ai_generated", "user", session["user_id"], f"Generated post copy with {provider}", self._source_ip())
+                audit(session["user_id"], "post.ai_generated", "user", session["user_id"], f"Generated post copy with {provider}", self._source_ip(), workspace_id=workspace_id)
                 self._json({"copy": copy}); return
             if path == "/api/me/timezone":
                 zone = timezone_name(payload.get("timezone"))
@@ -1674,6 +1867,82 @@ class Handler(SimpleHTTPRequestHandler):
                     connection.execute("DELETE FROM sessions WHERE user_id = ?", (session["user_id"],))
                 audit(session["user_id"], "user.password_changed", "user", session["user_id"], "Changed password and revoked sessions", self._source_ip())
                 self._json_session({"status": "password changed"}, self._create_session(session["user_id"])); return
+            if path == "/api/workspaces":
+                name = str(payload.get("name", "")).strip()
+                if not name or len(name) > MAX_WORKSPACE_NAME_LENGTH:
+                    self._json({"error": f"Use a workspace name of 1 to {MAX_WORKSPACE_NAME_LENGTH} characters."}, HTTPStatus.BAD_REQUEST); return
+                with db() as connection:
+                    workspace_id = create_workspace(connection, name, session["user_id"])
+                    connection.execute("UPDATE sessions SET active_workspace_id = ? WHERE id = ?", (workspace_id, session["id"]))
+                audit(session["user_id"], "workspace.created", "workspace", workspace_id, f"Created workspace {name}", self._source_ip(), workspace_id=workspace_id)
+                self._json({"id": workspace_id, "name": name, "role": "owner"}, HTTPStatus.CREATED); return
+            if path == "/api/me/workspace":
+                try:
+                    workspace_id = int(payload.get("workspace_id"))
+                except (TypeError, ValueError):
+                    self._json({"error": "workspace_id must be a workspace number."}, HTTPStatus.BAD_REQUEST); return
+                with db() as connection:
+                    membership = workspace_membership(connection, workspace_id, session["user_id"])
+                    if membership is None:
+                        self._json({"error": "You are not a member of that workspace."}, HTTPStatus.FORBIDDEN); return
+                    connection.execute("UPDATE sessions SET active_workspace_id = ? WHERE id = ?", (workspace_id, session["id"]))
+                self._json({"workspace": {"id": workspace_id, "name": membership["workspace_name"], "slug": membership["workspace_slug"], "role": membership["role"]}}); return
+            if path == "/api/workspaces/members":
+                workspace_id = self._require_workspace(session, "admin")
+                if workspace_id is None:
+                    return
+                username, member_role = str(payload.get("username", "")).strip(), str(payload.get("role", "editor")).strip()
+                if member_role not in {"viewer", "editor", "admin"}:
+                    self._json({"error": "Grant the viewer, editor, or admin role."}, HTTPStatus.BAD_REQUEST); return
+                if member_role == "admin" and session["workspace_role"] != "owner":
+                    self._json({"error": "Only the workspace owner can grant the admin role."}, HTTPStatus.FORBIDDEN); return
+                with db() as connection:
+                    user = connection.execute("SELECT id, username FROM users WHERE username = ? AND is_active = 1", (username,)).fetchone()
+                    if user is None:
+                        self._json({"error": "No active user has that username. An administrator can create the account first."}, HTTPStatus.NOT_FOUND); return
+                    if connection.execute("SELECT id FROM workspace_memberships WHERE workspace_id = ? AND user_id = ?", (workspace_id, user["id"])).fetchone():
+                        self._json({"error": "That user is already a member of this workspace."}, HTTPStatus.CONFLICT); return
+                    connection.execute("INSERT INTO workspace_memberships (workspace_id, user_id, role, invite_state, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)", (workspace_id, user["id"], member_role, now(), now()))
+                audit(session["user_id"], "workspace.member_added", "user", user["id"], f"Added {username} as workspace {member_role}", self._source_ip(), workspace_id=workspace_id)
+                self._json({"user_id": user["id"], "username": user["username"], "role": member_role}, HTTPStatus.CREATED); return
+            if path.startswith("/api/workspaces/members/") and path.endswith("/role"):
+                workspace_id = self._require_workspace(session, "admin")
+                if workspace_id is None:
+                    return
+                member_user_id, member_role = int(path.split("/")[4]), str(payload.get("role", "")).strip()
+                if member_role not in {"viewer", "editor", "admin"}:
+                    self._json({"error": "Grant the viewer, editor, or admin role."}, HTTPStatus.BAD_REQUEST); return
+                if member_user_id == session["user_id"]:
+                    self._json({"error": "You cannot change your own workspace role."}, HTTPStatus.BAD_REQUEST); return
+                with db() as connection:
+                    membership = connection.execute("SELECT id, role FROM workspace_memberships WHERE workspace_id = ? AND user_id = ?", (workspace_id, member_user_id)).fetchone()
+                    if membership is None:
+                        self._json({"error": "That user is not a member of this workspace."}, HTTPStatus.NOT_FOUND); return
+                    if membership["role"] == "owner":
+                        self._json({"error": "The workspace owner's role cannot be changed."}, HTTPStatus.BAD_REQUEST); return
+                    if session["workspace_role"] != "owner" and (membership["role"] == "admin" or member_role == "admin"):
+                        self._json({"error": "Only the workspace owner can change admin memberships."}, HTTPStatus.FORBIDDEN); return
+                    connection.execute("UPDATE workspace_memberships SET role = ?, updated_at = ? WHERE id = ?", (member_role, now(), membership["id"]))
+                audit(session["user_id"], "workspace.member_role_changed", "user", member_user_id, f"Changed workspace role to {member_role}", self._source_ip(), workspace_id=workspace_id)
+                self._json({"user_id": member_user_id, "role": member_role}); return
+            if path.startswith("/api/workspaces/members/") and path.endswith("/remove"):
+                workspace_id = self._require_workspace(session, "admin")
+                if workspace_id is None:
+                    return
+                member_user_id = int(path.split("/")[4])
+                if member_user_id == session["user_id"]:
+                    self._json({"error": "You cannot remove yourself from a workspace."}, HTTPStatus.BAD_REQUEST); return
+                with db() as connection:
+                    membership = connection.execute("SELECT id, role FROM workspace_memberships WHERE workspace_id = ? AND user_id = ?", (workspace_id, member_user_id)).fetchone()
+                    if membership is None:
+                        self._json({"error": "That user is not a member of this workspace."}, HTTPStatus.NOT_FOUND); return
+                    if membership["role"] == "owner":
+                        self._json({"error": "The workspace owner cannot be removed."}, HTTPStatus.BAD_REQUEST); return
+                    if session["workspace_role"] != "owner" and membership["role"] == "admin":
+                        self._json({"error": "Only the workspace owner can remove an admin."}, HTTPStatus.FORBIDDEN); return
+                    connection.execute("DELETE FROM workspace_memberships WHERE id = ?", (membership["id"],))
+                audit(session["user_id"], "workspace.member_removed", "user", member_user_id, "Removed workspace member", self._source_ip(), workspace_id=workspace_id)
+                self._json({"status": "removed"}); return
             if path == "/api/admin/users":
                 if session["role"] != "admin":
                     self._json({"error": "Administrator access required."}, HTTPStatus.FORBIDDEN); return
@@ -1684,6 +1953,7 @@ class Handler(SimpleHTTPRequestHandler):
                 salt = secrets.token_bytes(16)
                 with db() as connection:
                     user_id = insert_id(connection, "INSERT INTO users (username, password_salt, password_hash, role, timezone, created_at) VALUES (?, ?, ?, ?, ?, ?)", (username, salt.hex(), hash_password(password, salt), role, zone, now()))
+                    ensure_personal_workspace(connection, user_id, username)
                 audit(session["user_id"], "user.created", "user", user_id, f"Created {role} user {username}", self._source_ip())
                 self._json({"id": user_id, "username": username, "role": role, "timezone": zone}, HTTPStatus.CREATED); return
             if path.startswith("/api/admin/users/") and path.endswith("/disable"):
@@ -1700,6 +1970,9 @@ class Handler(SimpleHTTPRequestHandler):
                 audit(session["user_id"], "user.disabled", "user", user_id, "Disabled user and revoked sessions", self._source_ip())
                 self._json({"status": "disabled"}); return
             if path == "/api/connections":
+                workspace_id = self._require_workspace(session, "admin")
+                if workspace_id is None:
+                    return
                 provider = str(payload.get("provider", "")).strip()
                 account_id = str(payload.get("external_account_id", "")).strip()
                 display_name = str(payload.get("display_name", "")).strip()
@@ -1721,21 +1994,30 @@ class Handler(SimpleHTTPRequestHandler):
                 if not secrets_to_store:
                     self._json({"error": "At least one credential is required."}, HTTPStatus.BAD_REQUEST); return
                 with db() as connection:
+                    duplicate = connection.execute("SELECT id FROM connections WHERE (workspace_id = ? OR user_id = ?) AND provider = ? AND external_account_id = ?", (workspace_id, session["user_id"], provider, account_id)).fetchone()
+                    if duplicate:
+                        self._json({"error": "This provider account is already connected in this workspace or another of your workspaces."}, HTTPStatus.CONFLICT); return
                     connection_id = insert_id(connection,
-                        "INSERT INTO connections (user_id, provider, external_account_id, display_name, encrypted_secrets, settings_json, token_expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (session["user_id"], provider, account_id, display_name, encrypt_secrets(secrets_to_store), json.dumps(settings), token_expiry, now()),
+                        "INSERT INTO connections (user_id, workspace_id, provider, external_account_id, display_name, encrypted_secrets, settings_json, token_expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (session["user_id"], workspace_id, provider, account_id, display_name, encrypt_secrets(secrets_to_store), json.dumps(settings), token_expiry, now()),
                     )
-                audit(session["user_id"], "connection.created", "connection", connection_id, f"Created {provider} connection {display_name}", self._source_ip())
+                audit(session["user_id"], "connection.created", "connection", connection_id, f"Created {provider} connection {display_name}", self._source_ip(), workspace_id=workspace_id)
                 self._json({"id": connection_id, "provider": provider, "external_account_id": account_id, "display_name": display_name}, HTTPStatus.CREATED); return
             if path.startswith("/api/connections/") and path.endswith("/disable"):
+                workspace_id = self._require_workspace(session, "admin")
+                if workspace_id is None:
+                    return
                 connection_id = int(path.split("/")[3])
                 with db() as connection:
-                    changed = connection.execute("UPDATE connections SET is_active = 0 WHERE id = ? AND user_id = ?", (connection_id, session["user_id"]))
+                    changed = connection.execute("UPDATE connections SET is_active = 0 WHERE id = ? AND workspace_id = ?", (connection_id, workspace_id))
                     if changed.rowcount != 1:
                         self._json({"error": "Connection not found."}, HTTPStatus.NOT_FOUND); return
-                audit(session["user_id"], "connection.disabled", "connection", connection_id, "Disabled provider connection", self._source_ip())
+                audit(session["user_id"], "connection.disabled", "connection", connection_id, "Disabled provider connection", self._source_ip(), workspace_id=workspace_id)
                 self._json({"status": "disabled"}); return
             if path.startswith("/api/connections/") and path.endswith("/rotate"):
+                workspace_id = self._require_workspace(session, "admin")
+                if workspace_id is None:
+                    return
                 connection_id = int(path.split("/")[3])
                 secret_values = payload.get("secrets", {})
                 token_expiry = str(payload.get("token_expires_at", "")).strip() or None
@@ -1747,14 +2029,16 @@ class Handler(SimpleHTTPRequestHandler):
                 if token_expiry and token_is_expired(token_expiry):
                     self._json({"error": "token_expires_at must be a future ISO 8601 timestamp with timezone."}, HTTPStatus.BAD_REQUEST); return
                 with db() as connection:
-                    current = connection.execute("SELECT encrypted_secrets FROM connections WHERE id = ? AND user_id = ?", (connection_id, session["user_id"])).fetchone()
+                    current = connection.execute("SELECT encrypted_secrets FROM connections WHERE id = ? AND workspace_id = ?", (connection_id, workspace_id)).fetchone()
                     if current is None:
                         self._json({"error": "Connection not found."}, HTTPStatus.NOT_FOUND); return
                     merged = {**decrypt_secrets(current["encrypted_secrets"]), **secrets_to_store}
                     connection.execute("UPDATE connections SET encrypted_secrets = ?, token_expires_at = ?, is_active = 1 WHERE id = ?", (encrypt_secrets(merged), token_expiry, connection_id))
-                audit(session["user_id"], "connection.rotated", "connection", connection_id, "Rotated provider credentials", self._source_ip())
+                audit(session["user_id"], "connection.rotated", "connection", connection_id, "Rotated provider credentials", self._source_ip(), workspace_id=workspace_id)
                 self._json({"status": "rotated", "token_expires_at": token_expiry}); return
             if path == "/api/uploads":
+                if self._require_workspace(session, "editor") is None:
+                    return
                 content_type, encoded = str(payload.get("content_type", "")).lower(), payload.get("data", "")
                 if content_type not in IMAGE_TYPES or not isinstance(encoded, str):
                     self._json({"error": "Upload a PNG, JPEG, GIF, or WebP image."}, HTTPStatus.BAD_REQUEST); return
@@ -1771,6 +2055,9 @@ class Handler(SimpleHTTPRequestHandler):
                 filename = f"{uuid.uuid4().hex}{IMAGE_TYPES[actual_type]}"
                 self._json({"url": store_media(filename, actual_type, image)}, HTTPStatus.CREATED); return
             if path == "/api/posts":
+                workspace_id = self._require_workspace(session, "editor")
+                if workspace_id is None:
+                    return
                 body, legacy_channel = str(payload.get("body", "")).strip(), str(payload.get("channel", "")).strip()
                 requested_channels = payload.get("channels", [legacy_channel])
                 if not isinstance(requested_channels, list) or not requested_channels:
@@ -1797,38 +2084,44 @@ class Handler(SimpleHTTPRequestHandler):
                 with db() as connection:
                     if target_ids:
                         placeholders = ",".join("?" for _ in target_ids)
-                        selected = connection.execute(f"SELECT id, provider FROM connections WHERE user_id = ? AND is_active = 1 AND (token_expires_at IS NULL OR token_expires_at > ?) AND id IN ({placeholders})", (session["user_id"], now(), *target_ids)).fetchall()
+                        selected = connection.execute(f"SELECT id, provider FROM connections WHERE workspace_id = ? AND is_active = 1 AND (token_expires_at IS NULL OR token_expires_at > ?) AND id IN ({placeholders})", (workspace_id, now(), *target_ids)).fetchall()
                         if len(selected) != len(set(target_ids)) or {row["provider"] for row in selected} != set(channels):
                             self._json({"error": "Select active accounts for every chosen platform."}, HTTPStatus.BAD_REQUEST); return
                     elif len(channels) != 1:
                         self._json({"error": "Connect an account for each platform when publishing to more than one platform."}, HTTPStatus.BAD_REQUEST); return
                     for channel in channels:
                         validate_post(channel, body, image_url, len(image_urls))
-                    post_id = insert_id(connection, "INSERT INTO posts (user_id, body, channel, state, scheduled_for, scheduled_timezone, image_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (session["user_id"], body, channels[0], "scheduled" if schedule else "draft", schedule, schedule_zone if schedule else None, image_url, now()))
+                    post_id = insert_id(connection, "INSERT INTO posts (user_id, workspace_id, body, channel, state, scheduled_for, scheduled_timezone, image_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (session["user_id"], workspace_id, body, channels[0], "scheduled" if schedule else "draft", schedule, schedule_zone if schedule else None, image_url, now()))
                     for target_id in dict.fromkeys(target_ids):
                         connection.execute("INSERT INTO post_targets (post_id, connection_id) VALUES (?, ?)", (post_id, target_id))
                     for position, url in enumerate(image_urls):
                         connection.execute("INSERT INTO post_media (post_id, media_url, position) VALUES (?, ?, ?)", (post_id, url, position))
                     row = dict(connection.execute("SELECT * FROM posts WHERE id = ?", (post_id,)).fetchone())
                 row["media_urls"] = image_urls
-                audit(session["user_id"], "post.created", "post", post_id, f"Created {'/'.join(channels)} post", self._source_ip())
+                audit(session["user_id"], "post.created", "post", post_id, f"Created {'/'.join(channels)} post", self._source_ip(), workspace_id=workspace_id)
                 self._json(row, HTTPStatus.CREATED); return
             if path.startswith("/api/posts/") and path.endswith("/remove"):
+                workspace_id = self._require_workspace(session, "editor")
+                if workspace_id is None:
+                    return
                 post_id = int(path.split("/")[3])
                 with db() as connection:
-                    post = connection.execute("SELECT state FROM posts WHERE id = ? AND user_id = ?", (post_id, session["user_id"])).fetchone()
+                    post = connection.execute("SELECT state FROM posts WHERE id = ? AND workspace_id = ?", (post_id, workspace_id)).fetchone()
                     if post is None or post["state"] not in {"draft", "scheduled", "failed"}:
-                        self._json({"error": "Only your drafts, scheduled posts, or failed posts can be removed from the queue."}, HTTPStatus.CONFLICT); return
+                        self._json({"error": "Only this workspace's drafts, scheduled posts, or failed posts can be removed from the queue."}, HTTPStatus.CONFLICT); return
                     connection.execute("DELETE FROM deliveries WHERE post_id = ?", (post_id,))
                     connection.execute("DELETE FROM post_media WHERE post_id = ?", (post_id,))
                     connection.execute("DELETE FROM post_targets WHERE post_id = ?", (post_id,))
-                    connection.execute("DELETE FROM posts WHERE id = ? AND user_id = ?", (post_id, session["user_id"]))
-                audit(session["user_id"], "post.removed", "post", post_id, "Removed unpublished post from queue", self._source_ip())
+                    connection.execute("DELETE FROM posts WHERE id = ? AND workspace_id = ?", (post_id, workspace_id))
+                audit(session["user_id"], "post.removed", "post", post_id, "Removed unpublished post from queue", self._source_ip(), workspace_id=workspace_id)
                 self._json({"status": "removed"}); return
             if path.startswith("/api/posts/") and path.endswith("/delete-from-channels"):
+                workspace_id = self._require_workspace(session, "editor")
+                if workspace_id is None:
+                    return
                 post_id = int(path.split("/")[3])
                 with db() as connection:
-                    row = connection.execute("SELECT * FROM posts WHERE id = ? AND user_id = ? AND state = 'published'", (post_id, session["user_id"])).fetchone()
+                    row = connection.execute("SELECT * FROM posts WHERE id = ? AND workspace_id = ? AND state = 'published'", (post_id, workspace_id)).fetchone()
                     targets = [dict(item) for item in connection.execute("SELECT post_targets.connection_id, post_targets.external_id, connections.* FROM post_targets JOIN connections ON connections.id = post_targets.connection_id WHERE post_targets.post_id = ? AND post_targets.state = 'published'", (post_id,)).fetchall()]
                 if row is None:
                     self._json({"error": "Only one of your published posts can be deleted from channels."}, HTTPStatus.NOT_FOUND); return
@@ -1853,36 +2146,46 @@ class Handler(SimpleHTTPRequestHandler):
                 elif failed:
                     with db() as connection:
                         connection.execute("UPDATE posts SET last_error = ? WHERE id = ?", ("Some channels could not delete the post.", post_id))
-                audit(session["user_id"], "post.remote_delete", "post", post_id, f"Deleted from {len(deleted)} channel(s), failed on {len(failed)}", self._source_ip())
+                audit(session["user_id"], "post.remote_delete", "post", post_id, f"Deleted from {len(deleted)} channel(s), failed on {len(failed)}", self._source_ip(), workspace_id=workspace_id)
                 self._json({"deleted": deleted, "failed": failed}, HTTPStatus.OK if deleted else HTTPStatus.BAD_GATEWAY); return
             if path.startswith("/api/posts/") and path.endswith("/schedule"):
+                workspace_id = self._require_workspace(session, "editor")
+                if workspace_id is None:
+                    return
                 post_id, schedule_zone = int(path.split("/")[3]), timezone_name(payload.get("scheduled_timezone") or session["timezone"])
                 schedule = self._schedule_time(payload.get("scheduled_for", ""), schedule_zone)
                 with db() as connection:
-                    cursor = connection.execute("UPDATE posts SET state = 'scheduled', scheduled_for = ?, scheduled_timezone = ?, attempts = 0, last_error = NULL WHERE id = ? AND user_id = ? AND state != 'published'", (schedule, schedule_zone, post_id, session["user_id"]))
-                    connection.execute("UPDATE post_targets SET state = 'pending', last_error = NULL WHERE post_id = ?", (post_id,))
+                    cursor = connection.execute("UPDATE posts SET state = 'scheduled', scheduled_for = ?, scheduled_timezone = ?, attempts = 0, last_error = NULL WHERE id = ? AND workspace_id = ? AND state != 'published'", (schedule, schedule_zone, post_id, workspace_id))
+                    if cursor.rowcount == 1:
+                        connection.execute("UPDATE post_targets SET state = 'pending', last_error = NULL WHERE post_id = ?", (post_id,))
                 if cursor.rowcount != 1:
                     self._json({"error": "Post not found or already published."}, HTTPStatus.NOT_FOUND); return
-                audit(session["user_id"], "post.scheduled", "post", post_id, f"Scheduled for {schedule}", self._source_ip())
+                audit(session["user_id"], "post.scheduled", "post", post_id, f"Scheduled for {schedule}", self._source_ip(), workspace_id=workspace_id)
                 self._json({"status": "scheduled"}); return
             if path.startswith("/api/posts/") and path.endswith("/publish"):
+                workspace_id = self._require_workspace(session, "editor")
+                if workspace_id is None:
+                    return
                 post_id = int(path.split("/")[3])
                 with db() as connection:
-                    found = connection.execute("SELECT id FROM posts WHERE id = ? AND user_id = ? AND state != 'published'", (post_id, session["user_id"])).fetchone()
+                    found = connection.execute("SELECT id FROM posts WHERE id = ? AND workspace_id = ? AND state != 'published'", (post_id, workspace_id)).fetchone()
                     if found is None:
                         self._json({"error": "Post not found or already published."}, HTTPStatus.NOT_FOUND); return
-                    connection.execute("UPDATE posts SET state = 'scheduled', scheduled_for = ? WHERE id = ? AND user_id = ?", (now(), post_id, session["user_id"]))
-                audit(session["user_id"], "post.queued", "post", post_id, "Queued for immediate delivery", self._source_ip())
+                    connection.execute("UPDATE posts SET state = 'scheduled', scheduled_for = ? WHERE id = ? AND workspace_id = ?", (now(), post_id, workspace_id))
+                audit(session["user_id"], "post.queued", "post", post_id, "Queued for immediate delivery", self._source_ip(), workspace_id=workspace_id)
                 self._json({"status": "queued"}, HTTPStatus.ACCEPTED); return
             if path.startswith("/api/posts/") and path.endswith("/retry"):
+                workspace_id = self._require_workspace(session, "editor")
+                if workspace_id is None:
+                    return
                 post_id = int(path.split("/")[3])
                 with db() as connection:
-                    cursor = connection.execute("UPDATE posts SET state = 'scheduled', scheduled_for = ?, scheduled_timezone = 'UTC', attempts = 0, publishing_started_at = NULL, last_error = NULL WHERE id = ? AND user_id = ? AND state = 'failed'", (now(), post_id, session["user_id"]))
+                    cursor = connection.execute("UPDATE posts SET state = 'scheduled', scheduled_for = ?, scheduled_timezone = 'UTC', attempts = 0, publishing_started_at = NULL, last_error = NULL WHERE id = ? AND workspace_id = ? AND state = 'failed'", (now(), post_id, workspace_id))
                     if cursor.rowcount == 1:
                         connection.execute("UPDATE post_targets SET state = 'pending', last_error = NULL WHERE post_id = ? AND state != 'published'", (post_id,))
                 if cursor.rowcount != 1:
-                    self._json({"error": "Only one of your failed posts can be retried."}, HTTPStatus.NOT_FOUND); return
-                audit(session["user_id"], "post.retried", "post", post_id, "Manually retried failed delivery", self._source_ip())
+                    self._json({"error": "Only this workspace's failed posts can be retried."}, HTTPStatus.NOT_FOUND); return
+                audit(session["user_id"], "post.retried", "post", post_id, "Manually retried failed delivery", self._source_ip(), workspace_id=workspace_id)
                 self._json({"status": "queued"}, HTTPStatus.ACCEPTED); return
             self._json({"error": "Not found."}, HTTPStatus.NOT_FOUND)
         except (json.JSONDecodeError, ValueError) as error:

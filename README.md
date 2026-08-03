@@ -12,6 +12,7 @@ For a Cloudflare Tunnel, Traefik, Caddy, or Nginx Proxy Manager deployment, rout
 
 ## What works today
 
+- Organize work in shared workspaces with `owner`, `admin`, `editor`, and `viewer` roles; posts and channel connections belong to the workspace, are shared with its members, and are isolated from every other workspace.
 - Create drafts for Facebook, Instagram, Threads, X, Telegram, Discord, and LinkedIn.
 - Schedule a post in any IANA timezone (for example `Asia/Hong_Kong` or `Europe/London`); it is stored as UTC for reliable delivery.
 - Upload one byte-validated PNG, JPEG, GIF, or WebP image per post (maximum 5 MB).
@@ -116,7 +117,7 @@ Use **Remove** in the content queue to permanently remove an unpublished draft, 
 
 The publish timezone is an IANA timezone dropdown populated by the browser (for example `Asia/Hong_Kong`). Sosopo converts the chosen local date/time to UTC and stores the selected timezone with the post.
 
-The dashboard's **Connected accounts** form creates and disables account records. The underlying `POST /api/connections` API requires a signed-in session plus its CSRF token and accepts a provider, display name, external account ID, optional settings, and provider secrets. Use `access_token` for Facebook, Instagram, Threads, X, and LinkedIn; use `bot_token` for Telegram; use `webhook_url` for Discord. `external_account_id` is the Page/account/profile ID, LinkedIn author URN, or Telegram chat/channel ID. For Discord, paste the full incoming webhook URL: Sosopo derives and stores only its webhook ID outside the encrypted secret. Manual encrypted credential entry remains available for providers or environments where OAuth is not configured.
+The dashboard's **Connected accounts** form creates and disables account records. The underlying `POST /api/connections` API requires a signed-in session holding the workspace `admin` or `owner` role plus its CSRF token and accepts a provider, display name, external account ID, optional settings, and provider secrets. Use `access_token` for Facebook, Instagram, Threads, X, and LinkedIn; use `bot_token` for Telegram; use `webhook_url` for Discord. `external_account_id` is the Page/account/profile ID, LinkedIn author URN, or Telegram chat/channel ID. For Discord, paste the full incoming webhook URL: Sosopo derives and stores only its webhook ID outside the encrypted secret. Manual encrypted credential entry remains available for providers or environments where OAuth is not configured.
 
 ### OAuth account connection
 
@@ -340,9 +341,26 @@ In **Hosts → Proxy Hosts**, create a host for `social.example.com` with:
 
 If Nginx Proxy Manager and Sosopo run in Compose together, attach both services to the same non-public network and use `sosopo:8080`. Restrict the Nginx Proxy Manager administration UI to trusted IPs.
 
+## Workspaces and roles
+
+Sosopo organizes posts, media, and channel connections into workspaces. Every user starts with a personal workspace, can create more, and can belong to several at once. The active workspace is chosen with the selector in the top bar, and every server-side query and action is scoped to the signed-in member's active workspace.
+
+Workspace roles are separate from the instance `admin`/`user` roles:
+
+| Workspace role | Allows |
+| --- | --- |
+| `viewer` | Read the workspace queue, channels, and delivery history. |
+| `editor` | Everything a viewer can, plus creating, scheduling, publishing, retrying, and removing posts, uploading images, and AI drafting. |
+| `admin` | Everything an editor can, plus connecting, rotating, and disabling channel accounts and managing workspace members. |
+| `owner` | Everything an admin can, plus granting or revoking the workspace `admin` role. The workspace creator is its owner and cannot be removed or demoted. |
+
+Workspace admins add existing local or SSO accounts by username in **Team → Workspace members**; instance administrators create those accounts in **Team → Instance accounts**. Channel connections belong to the workspace, so every authorized member can select them in the composer while the credentials stay encrypted server-side and are never returned to a browser. Posts record their author for audit history but are owned by the workspace.
+
+Upgrading an existing installation is safe: on the first start after this upgrade, each existing user automatically receives an isolated personal workspace containing exactly the posts, connections, and audit history they already owned. Nothing is merged, so nothing becomes visible to another user. AI provider configuration deliberately remains instance-wide until Phase 4 of the roadmap. One provider account can currently be connected in only one workspace per connecting user; reconnecting the same account from a second workspace is rejected with a clear error.
+
 ## Users and SSO
 
-Sosopo has `admin` and `user` roles. Posts and account connections belong to one user and are filtered server-side. The initial local account is an administrator. Administrators use the dashboard's **User administration** section or `GET`/`POST /api/admin/users` to list/create local users; creation needs `username`, a 12-character-or-longer `password`, optional `role` (`user` or `admin`), and optional IANA `timezone`. Disable a compromised or departed user with `POST /api/admin/users/{id}/disable` (CSRF protected); it immediately invalidates every session and blocks both local and SSO login. An administrator cannot disable themself.
+Sosopo has `admin` and `user` roles. Posts and account connections belong to one workspace and are filtered server-side by the active workspace membership. The initial local account is an administrator. Administrators use the dashboard's **User administration** section or `GET`/`POST /api/admin/users` to list/create local users; creation needs `username`, a 12-character-or-longer `password`, optional `role` (`user` or `admin`), and optional IANA `timezone`. Disable a compromised or departed user with `POST /api/admin/users/{id}/disable` (CSRF protected); it immediately invalidates every session and blocks both local and SSO login. An administrator cannot disable themself.
 
 Every signed-in user can sign out from the dashboard; this calls the CSRF-protected `POST /api/logout` endpoint. Administrators can also disable another active user from the dashboard, with immediate session revocation.
 
@@ -400,6 +418,11 @@ Sosopo converts this to UTC before persisting and delivering it. Update the sign
 | `/api/auth/oidc/login` | `GET` | Start configured OpenID Connect sign-in. |
 | `/api/session` | `GET` | Current user, role, timezone, and CSRF token. |
 | `/api/me/timezone` | `POST` | Set the signed-in user's default IANA timezone. |
+| `/api/me/workspace` | `POST` | Switch the session's active workspace (membership required). |
+| `/api/workspaces` | `GET`, `POST` | List the member's workspaces or create a new one. |
+| `/api/workspaces/members` | `GET`, `POST` | Workspace-admin member listing and add-by-username. |
+| `/api/workspaces/members/{id}/role` | `POST` | Change a member's workspace role (owner-guarded). |
+| `/api/workspaces/members/{id}/remove` | `POST` | Remove a member from the active workspace. |
 | `/api/me/password` | `POST` | Rotate local password and revoke existing sessions. |
 | `/api/admin/users` | `GET`, `POST` | Administrator-only user management. |
 | `/api/admin/users/{id}/disable` | `POST` | Disable an account and revoke its sessions. |
