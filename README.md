@@ -2,7 +2,7 @@
 
 Sosopo is a self-hosted social-media publishing workspace. It supports local accounts, optional OpenID Connect SSO, isolated user data, drafts, image attachments, timezone-aware scheduling, and provider-based delivery.
 
-Licensed under [MIT](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) for local checks and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
+Licensed under [MIT](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) for local checks, [SECURITY.md](SECURITY.md) for private vulnerability reporting, and [ROADMAP.md](ROADMAP.md) for the multi-workspace hosted-platform roadmap.
 
 ## Documentation website
 
