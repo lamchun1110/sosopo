@@ -34,10 +34,11 @@ reload order in `app/server.py`: `errors` → `config` → `database` → `secur
 → `http_client` → `audit` → `workspaces` → `plans` → `billing` →
 `invitations` → `media_storage` → `ai_adapters` → `ai_providers` →
 `media_jobs` → `oauth` → `connections` → `schema` → `publishing`.
-`app/server.py` holds the HTTP `Handler`, the entrypoint, and a
-hand-written re-export block that keeps
-`app.server` the one public namespace for tests, `app/worker.py`, `scripts/`,
-and the container healthcheck.
+`app/routes/` then holds the nine HTTP route-family mixins (A1b), which import
+from the modules above and are reloaded after them. `app/server.py` holds the
+`Handler` (dispatch, shared request helpers, static files), the entrypoint, and
+a hand-written re-export block that keeps `app.server` the one public namespace
+for tests, `app/worker.py`, `scripts/`, and the container healthcheck.
 
 Two conventions exist because the test suite calls
 `importlib.reload(app.server)` after changing the environment:
@@ -110,19 +111,21 @@ Split into 17 modules of 12–329 lines plus `app/server.py`. See
 **Current state** for the layout and the two conventions it introduced.
 93/93 tests green with no test edits; all three containers healthy.
 
-### A1b · Split the `Handler` route chain — P1, M
-A1 left `app/server.py` at ~1,550 lines: ~215 lines of imports and re-exports
-plus the `Handler` itself, whose `do_GET` (~420 lines) and `do_POST` (~690
-lines) are single `if`-chains. This is the one file still over the 800-line
-target. Introduce an explicit route table or per-family mixins
-(`auth`, `posts`, `connections`, `media`, `team`, `ai`, `billing`) so each
-route family lives in its own module, keeping `Handler` as dispatch plus the
-shared `_json`/`_session`/`_require_workspace` helpers.
-**Constraints:** the `if`-chain's fallthrough-to-404 ordering is behavior —
-preserve it, including which check runs first for overlapping prefixes. Same
-dual-entry and reload rules as A1.
-**Accept:** full suite green with no edits to existing tests; every module
-≤800 lines; no behavior change.
+### A1b · Split the `Handler` route chain — **done**
+`app/routes/` holds nine mixins, each owning one slice of the HTTP surface and
+returning `True` once it has answered: `public` (setup/sign-in/SSO/health plus
+the billing webhook), `connections`, `posts`, `ai`, `admin`, `media`, `team`,
+`account`, `billing`. `Handler` keeps dispatch, the shared `_json`/`_session`/
+`_require_workspace` helpers, and static file serving.
+
+Reordering routes across families is safe here because **no two route
+predicates in `do_GET` or `do_POST` can match the same path** — this was
+proven mechanically before the split, and is worth re-proving if you add a
+route whose pattern overlaps an existing one. What still matters is the phase
+order inside the dispatchers: public routes, then the rate-limit gate, then
+sign-out, then the auth gate, then authenticated families, then 404.
+
+`app/server.py` is now 501 lines and every module is under 800.
 
 ### A2 · Safe multi-worker job claiming — P2, M
 `worker.py`'s docstring says scaling needs row-level locking. Posts already
