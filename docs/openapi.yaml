@@ -1,0 +1,693 @@
+openapi: 3.1.0
+info:
+  title: Sosopo HTTP API
+  version: '1.0'
+  description: >-
+    Every endpoint Sosopo exposes. Requests and responses are JSON unless
+    noted. Errors share one shape: an object with a human-readable `error`
+    string. Tenant scope is always taken from the session's active
+    workspace on the server; no endpoint accepts a workspace id from the
+    client to select a tenant.
+servers:
+  - url: /
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: sosopo_session
+      description: Set by /api/setup, /api/login, /api/signup, and the SSO callback.
+    csrfToken:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+      description: >-
+        Required on every state-changing request. Read it from
+        GET /api/session as `csrf_token`.
+  responses:
+    Error:
+      description: The request was refused; `error` explains why.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string }
+paths:
+  /api/admin/ai-providers:
+    get:
+      summary: Instance-wide AI provider configuration (never returns keys).
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      summary: Save an instance-wide AI provider credential.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/ai-providers/{provider}/models:
+    get:
+      summary: Refresh one instance provider's model catalog.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/ai-providers/{provider}/remove:
+    post:
+      summary: Remove an instance-wide AI provider credential.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/audit-events:
+    get:
+      summary: Recent audit events.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/status:
+    get:
+      summary: Queue depth, worker heartbeat, and the newest delivery failure.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/users:
+    get:
+      summary: All instance users.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      summary: Create an instance user.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/users/{id}/disable:
+    post:
+      summary: Disable one instance user.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/workspaces:
+    get:
+      summary: Audited, metadata-only listing of every workspace.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/ai/generate:
+    post:
+      summary: Generate post copy. Spends one AI credit.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/ai/providers:
+    get:
+      summary: AI providers available to the caller, with their model catalogs.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/auth/oidc/callback:
+    get:
+      summary: Complete the OIDC flow and open a session.
+      security: []
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/auth/oidc/login:
+    get:
+      summary: Begin the OIDC authorization-code flow.
+      security: []
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/billing/webhook:
+    post:
+      summary: Stripe webhook. Verified by signature, not by session.
+      security: []
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/connections:
+    get:
+      summary: Connected provider accounts, with health, for the active workspace.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      summary: Add a provider account with encrypted credentials.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/connections/{id}/disable:
+    post:
+      summary: Disable one provider account.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/connections/{id}/rotate:
+    post:
+      summary: Replace one provider account's credentials.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/dashboard:
+    get:
+      summary: Posts, connections, and channel status for the active workspace.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/health:
+    get:
+      summary: Liveness and database reachability.
+      security: []
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+    head:
+      summary: Liveness probe without a body.
+      security: []
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/invitations/{token}:
+    get:
+      summary: Preview one invitation before accepting it.
+      security: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/invitations/{token}/accept:
+    post:
+      summary: Accept an invitation and join its workspace.
+      security: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/login:
+    post:
+      summary: Sign in with a local account.
+      security: []
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/logout:
+    post:
+      summary: End the current session.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/me/password:
+    post:
+      summary: Change the caller's password.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/me/settings:
+    post:
+      summary: Change the caller's profile settings.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/me/timezone:
+    post:
+      summary: Change the caller's timezone.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/me/workspace:
+    post:
+      summary: Switch the caller's active workspace.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/media/jobs:
+    get:
+      summary: AI media jobs for the active workspace, with progress.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      summary: Queue an AI image or video job. Spends one AI credit.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/media/jobs/{id}/review:
+    post:
+      summary: Approve or reject one generated asset.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/media/library:
+    get:
+      summary: Approved media assets available to the composer.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/organizations:
+    get:
+      summary: Organizations the caller belongs to.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      summary: Create an organization; the caller becomes its owner.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/organizations/{id}/credits:
+    get:
+      summary: Organization, workspace, and member credit balances.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/organizations/{id}/credits/allocate:
+    post:
+      summary: Allocate organization credits to a workspace or member.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/organizations/{id}/members:
+    get:
+      summary: Members of one organization.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      summary: Add or re-role one organization member.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/organizations/{id}/workspaces:
+    get:
+      summary: Workspaces inside one organization.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      summary: Create a workspace inside one organization.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/posts:
+    post:
+      summary: Create a draft post for the active workspace.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/posts/{id}/delete-from-channels:
+    post:
+      summary: Delete one delivered post at the providers.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/posts/{id}/deliveries:
+    get:
+      summary: Delivery history for one post.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/posts/{id}/publish:
+    post:
+      summary: Publish one post immediately.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/posts/{id}/remove:
+    post:
+      summary: Delete one post from Sosopo.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/posts/{id}/retry:
+    post:
+      summary: Requeue one failed post.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/posts/{id}/schedule:
+    post:
+      summary: Schedule one post in a given timezone.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/session:
+    get:
+      summary: The signed-in user, their workspaces, and a CSRF token.
+      security: []
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/setup:
+    post:
+      summary: Create the first administrator and open a session.
+      security: []
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/setup-status:
+    get:
+      summary: Whether first-run setup is required and whether self-signup is open.
+      security: []
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/signup:
+    post:
+      summary: Self-service sign-up, when the deployment allows it.
+      security: []
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/social-oauth/callback:
+    get:
+      summary: Complete a social provider OAuth flow and store the connection.
+      security: []
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/social-oauth/{provider}/start:
+    get:
+      summary: Begin a social provider OAuth flow for the active workspace.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/uploads:
+    post:
+      summary: Upload one image for the active workspace.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces:
+    get:
+      summary: Workspaces the caller belongs to.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      summary: Create a personal workspace.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/ai-providers:
+    get:
+      summary: Workspace-scoped AI provider configuration (never returns keys).
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      summary: Save a workspace AI provider credential.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/ai-providers/{provider}/models:
+    get:
+      summary: Refresh one workspace provider's model catalog.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/ai-providers/{provider}/remove:
+    post:
+      summary: Remove a workspace AI provider credential.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/billing/checkout:
+    post:
+      summary: Start a Stripe subscription checkout. Owner only.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/billing/credits:
+    post:
+      summary: Start a one-time Stripe checkout for a credit pack. Owner only.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/credits:
+    get:
+      summary: Accounts funding the caller's AI actions, in resolution order.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/credits/allocate:
+    post:
+      summary: Allocate workspace credits to a member.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/delete:
+    post:
+      summary: Delete the active workspace. Owner only.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/export:
+    get:
+      summary: Secret-free export of the active workspace.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/invitations:
+    get:
+      summary: Outstanding invitations for the active workspace.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      summary: Invite someone to the active workspace by email.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/invitations/{id}/revoke:
+    post:
+      summary: Revoke one outstanding invitation.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/members:
+    get:
+      summary: Members of the active workspace.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      summary: Add a member to the active workspace.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/members/{id}/remove:
+    post:
+      summary: Remove one member from the active workspace.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/members/{id}/role:
+    post:
+      summary: Change one member's workspace role.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/settings:
+    post:
+      summary: Change owner-only workspace settings, including the AI budget cap.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/status:
+    get:
+      summary: Dashboard metrics for the active workspace.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }

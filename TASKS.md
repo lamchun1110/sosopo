@@ -27,7 +27,7 @@ All six phases of ROADMAP.md are complete and deployed:
 - `GET /api/workspaces/status` dashboard data, audited metadata-only
   `GET /api/admin/workspaces`, media/workspace Prometheus gauges (Phase 6).
 
-Suite: 173 tests, all passing.
+Suite: 178 tests, all passing (1 skipped without PyYAML).
 
 `app/` is split into focused modules (A1). Dependency order, which is also the
 reload order in `app/server.py`: `errors` → `config` → `database` → `security`
@@ -57,9 +57,9 @@ Two conventions exist because the test suite calls
   test replacement is visible to every caller. Add a new patchable seam to
   `_SEAMS`, never to the re-export block.
 
-Other key files: `app/index.html` (single-page portal), `tests/` (twelve files;
+Other key files: `app/index.html` (single-page portal), `tests/` (fourteen files;
 `test_workspaces.py` exports the `WorkspaceHttpCase` live-HTTP harness),
-`docs/index.html` (separate docs site), `scripts/`
+`docs/index.html` + `docs/openapi.yaml` (separate docs site), `scripts/`
 (backup/restore/preflight).
 
 ## Working agreements
@@ -159,13 +159,21 @@ on `window`, which is worse than the problem being solved.
 every `el('…')` target resolves to an id in the markup (checked mechanically).
 The authenticated views were not click-tested, since that needs credentials.
 
-### A4 · OpenAPI description of the HTTP API — P2, M
-CLAUDE.md demands API-first design. Hand-write `docs/openapi.yaml` covering
-every `/api/*` route (auth model: session cookie + `X-CSRF-Token`), serve it
-from the docs site, and add a test that every route string present in
-`Handler` appears in the spec (regex-scan `server.py` for `"/api/…"` literals).
-**Accept:** spec validates (`python -c` with a YAML load is enough — no new
-runtime deps), coverage test green, docs site links it.
+### A4 · OpenAPI description of the HTTP API — **done**
+`docs/openapi.yaml` (OpenAPI 3.1) describes all 65 paths / 77 operations,
+declares the auth model (`sosopo_session` cookie plus `X-CSRF-Token` on every
+state-changing request), and is linked from the docs site at `#api`.
+
+`tests/openapi_routes.py` discovers the HTTP surface from the route mixins by
+reading the source, and is the single source of truth shared by the spec and
+its check — so the two cannot disagree about what a route is. The test checks
+**both** directions: no route missing from the spec, and no spec path that no
+longer exists. It also asserts every authenticated POST declares `csrfToken`.
+
+PyYAML is not a runtime dependency, so the coverage check uses a strict
+structural parse and the full YAML load runs only when PyYAML happens to be
+installed. **When you add a route, add it to the spec in the same change** —
+the test will fail otherwise.
 
 ## B. Organizations and the credit system
 
