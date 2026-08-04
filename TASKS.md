@@ -368,21 +368,37 @@ cannot silently start leaking into an outbound prompt. A test asserts the
 payload carries real metrics and carries no credential, while the API key
 still appears in the *headers* where it belongs.
 
-### D4 · Campaign agent design (RFC) — P3, M (needs D1, D2)
-Design doc (`docs/rfcs/0001-campaign-agent.md`) for a multi-step agent:
-brief → strategy → calendar → drafts → (later) performance feedback loop.
-Cover: step orchestration on the existing job-queue pattern, human approval
-gates (reuse moderation model), credit accounting per step, failure recovery,
-and multi-agent collaboration boundaries. No implementation.
-**Accept:** RFC reviewed against the CLAUDE.md decision framework, with an
-incremental delivery plan whose first slice is shippable in ≤1 week.
+### D4 · Campaign agent design (RFC) — **done (needs review)**
+`docs/rfcs/0001-campaign-agent.md`. Steps (strategy → calendar → drafts →
+review) on the **existing** job-queue pattern — no new execution machinery;
+`agent_runs` + `agent_steps` claimed exactly like media jobs, so leases,
+retry, crash recovery, and multi-worker safety come for free. Approval gates
+reuse the media moderation model, and the agent's output ceiling stays where
+D2 put it: drafts only, never scheduled or published.
 
-### D5 · Auto-reply research (RFC) — P3, S
-Inbound comment/mention APIs differ wildly per platform and most need extra
-review/permissions. Produce `docs/rfcs/0002-auto-reply.md`: per-provider
-feasibility (Meta, X, Telegram, Discord), webhook vs polling, safety rails
-(never reply without a workspace-approved template/policy), and moderation.
-**Accept:** RFC only; explicit go/no-go recommendation per platform.
+**Slice 1 is ≤1 week and shippable alone:** the two tables, the claim loop,
+and only the `strategy` and `calendar` steps with one approval gate. That
+delivers "correct the strategy without regenerating everything" — the main
+complaint D2 leaves open — and proves the orchestration before harder steps
+exist.
+
+Three open questions are listed for the reviewer. No implementation.
+
+### D5 · Auto-reply research (RFC) — **done (needs review)**
+`docs/rfcs/0002-auto-reply.md`, with an explicit go/no-go per platform:
+**go** for Telegram and Discord, **no-go for now** for Meta and X (blocked by
+App Review and access tier, not by engineering effort), **blocked upstream**
+for Threads and LinkedIn.
+
+The RFC's core argument: the risk here is not ingestion but that **inbound
+text is untrusted input that reaches a model**. Rails proposed: policy off by
+default, inbound text passed as delimited data and never concatenated into
+instructions, human moderation by default, per-thread and per-hour caps,
+never replying to Sosopo's own replies, and escalation rather than a bland
+answer to a serious complaint.
+
+Polling-first for Telegram, because webhooks need a public HTTPS URL that most
+self-hosted installs do not have.
 
 ## E. Publishing depth (Postiz parity)
 
@@ -456,4 +472,4 @@ no secret fields accepted even if present in the file.
 2. ~~**B1 → B2 → B3 → B4**~~ done: the credit system arc is complete.
 3. D1 → D2 → D3 build directly on the credit + provider work.
 4. E-tasks are independent of A–D and safe for parallel agents.
-5. RFCs (D4, D5, F1) can run any time; implementation waits for review.
+5. D4 and D5 are written and awaiting review; F1 waits on nothing but time.
