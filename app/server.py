@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 # it depends on have themselves been reloaded.
 _SUBMODULES = (
     "errors", "config", "database", "security", "http_client", "audit", "workspaces", "plans", "billing",
-    "invitations", "organizations", "media_storage", "ai_adapters", "ai_providers", "media_jobs", "oauth",
+    "invitations", "organizations", "credits", "media_storage", "ai_adapters", "ai_providers", "media_jobs", "oauth",
     "connections", "schema",
     "publishing",
     # Route families last: each mixin imports from the modules above.
@@ -233,6 +233,17 @@ worker_healthy = _MODULES["publishing"].worker_healthy
 recover_stale_deliveries = _MODULES["publishing"].recover_stale_deliveries
 scheduler = _MODULES["publishing"].scheduler
 
+
+CREDIT_OWNER_TYPES = _MODULES["credits"].CREDIT_OWNER_TYPES
+credits_enforced = _MODULES["credits"].credits_enforced
+ensure_credit_account = _MODULES["credits"].ensure_credit_account
+credit_account = _MODULES["credits"].credit_account
+account_balance = _MODULES["credits"].account_balance
+record_credit_transaction = _MODULES["credits"].record_credit_transaction
+monthly_grant = _MODULES["credits"].monthly_grant
+grant_monthly_credits = _MODULES["credits"].grant_monthly_credits
+charge_ai_credit = _MODULES["credits"].charge_ai_credit
+refund_ai_credit = _MODULES["credits"].refund_ai_credit
 
 # Route families, mixed into Handler below. Each owns one slice of the HTTP
 # surface and returns True once it has answered a request.

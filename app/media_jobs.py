@@ -17,6 +17,7 @@ try:  # package import (tests, `python -m app.server`)
     from .database import Record, db
     from .errors import ProviderError
     from .media_storage import detected_image_type, inspect_image, store_media
+    from .credits import refund_ai_credit
     from .plans import enforce_storage_limit, record_usage
 except ImportError:  # script import (`python /app/app/server.py`)
     import config as cfg
@@ -26,6 +27,7 @@ except ImportError:  # script import (`python /app/app/server.py`)
     from database import Record, db
     from errors import ProviderError
     from media_storage import detected_image_type, inspect_image, store_media
+    from credits import refund_ai_credit
     from plans import enforce_storage_limit, record_usage
 
 
@@ -123,6 +125,7 @@ def run_media_job(job: dict[str, Any]) -> None:
     with db() as connection:
         connection.execute("UPDATE media_jobs SET status = 'failed', error = ?, updated_at = ? WHERE id = ?", (detail, now(), job["id"]))
         record_usage(connection, int(job["workspace_id"]), "ai_media", -1)
+        refund_ai_credit(connection, int(job["workspace_id"]), "ai_media_refund", job.get("user_id"))
 
 
 def media_worker() -> None:

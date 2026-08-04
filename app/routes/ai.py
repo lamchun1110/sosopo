@@ -15,6 +15,7 @@ try:  # package import (tests, `python -m app.server`)
     from ..config import CHANNELS
     from ..database import Record, db
     from ..errors import ProviderError
+    from ..credits import charge_ai_credit
     from ..plans import enforce_monthly_quota, record_usage
 except ImportError:  # script import (`python /app/app/server.py`)
     from ai_providers import AI_PROVIDERS, AI_PROVIDER_MODELS, ai_model_catalog, ai_provider_models, ai_provider_settings, available_ai_providers, generate_post_copy, remove_ai_provider_settings, save_ai_provider_settings, stored_ai_provider_settings
@@ -22,6 +23,7 @@ except ImportError:  # script import (`python /app/app/server.py`)
     from config import CHANNELS
     from database import Record, db
     from errors import ProviderError
+    from credits import charge_ai_credit
     from plans import enforce_monthly_quota, record_usage
 
 
@@ -123,6 +125,7 @@ class AiRoutes:
                 self._json({"error": "Choose valid post platforms for AI generation."}, HTTPStatus.BAD_REQUEST); return True
             with db() as connection:
                 enforce_monthly_quota(connection, workspace_id, "ai_generations", "ai_generations_per_month", "AI text generations")
+                charge_ai_credit(connection, workspace_id, "ai_generation", session["user_id"])
             try:
                 copy = generate_post_copy(provider, model, instruction, draft, [str(channel) for channel in channels], workspace_id)
             except ProviderError as error:

@@ -27,12 +27,12 @@ All six phases of ROADMAP.md are complete and deployed:
 - `GET /api/workspaces/status` dashboard data, audited metadata-only
   `GET /api/admin/workspaces`, media/workspace Prometheus gauges (Phase 6).
 
-Suite: 121 tests, all passing.
+Suite: 137 tests, all passing.
 
 `app/` is split into focused modules (A1). Dependency order, which is also the
 reload order in `app/server.py`: `errors` → `config` → `database` → `security`
 → `http_client` → `audit` → `workspaces` → `plans` → `billing` →
-`invitations` → `organizations` → `media_storage` → `ai_adapters` → `ai_providers` →
+`invitations` → `organizations` → `credits` → `media_storage` → `ai_adapters` → `ai_providers` →
 `media_jobs` → `oauth` → `connections` → `schema` → `publishing`.
 `app/routes/` then holds the ten HTTP route-family mixins (A1b, B1), which import
 from the modules above and are reloaded after them. `app/server.py` holds the
@@ -56,7 +56,7 @@ Two conventions exist because the test suite calls
   test replacement is visible to every caller. Add a new patchable seam to
   `_SEAMS`, never to the re-export block.
 
-Other key files: `app/index.html` (single-page portal), `tests/` (eight files;
+Other key files: `app/index.html` (single-page portal), `tests/` (nine files;
 `test_workspaces.py` exports the `WorkspaceHttpCase` live-HTTP harness),
 `docs/index.html` (separate docs site), `scripts/`
 (backup/restore/preflight).
@@ -174,21 +174,30 @@ Two rules to keep in mind when building on this:
 Personal workspaces keep `organization_id NULL`, and an installation that
 never creates an organization behaves exactly as before.
 
-### B2 · Auditable AI credit ledger — P1, L
-CLAUDE.md: credits are consumed **only** by AI usage (text + media); posts,
-scheduling, storage, seats never consume credits; transactions must be
-auditable. Add `credit_accounts` (owner_type: organization/workspace/user,
-owner_id, balance) and `credit_transactions` (account, delta, reason,
-actor_user_id, related metric/job id, created_at; append-only). Debit one
-credit per AI text generation and per media job (reuse the existing
-charge/refund points in `/api/ai/generate` and media jobs — keep the
-refund-on-failure behavior). In hosted mode, map plan quotas to a monthly
-credit grant (top up on period rollover); self-hosted defaults to an
-unlimited account (no debits recorded as failures, ledger optional via
-`SOSOPO_CREDITS_ENFORCED`). Keep `usage_records` for analytics.
-**Accept:** balance never goes negative under enforcement; every debit/credit
-has a transaction row; existing quota tests updated coherently; self-hosted
-default behavior unchanged.
+### B2 · Auditable AI credit ledger — **done**
+`credit_accounts` (owner_type organization/workspace/user, owner_id, balance,
+granted_period) and append-only `credit_transactions` (delta, `balance_after`,
+reason, actor, reference). `app/credits.py` owns all of it.
+
+Invariants worth preserving:
+
+- **Only AI usage spends credits.** One credit per AI text generation and per
+  media job, charged at the existing quota points in `/api/ai/generate` and
+  media job creation, refunded by `run_media_job` on failure. Publishing,
+  scheduling, storage, seats, and organizations never touch the ledger; there
+  is a regression test asserting that.
+- **`record_credit_transaction` is the only write path for a balance**, and it
+  raises *before* writing anything when a movement would go negative.
+- **The ledger is append-only.** Rows carry `balance_after` so an auditor can
+  verify without replaying the table.
+- **Self-hosted is unlimited and records nothing.** `credits_enforced()` is
+  False unless hosted or `SOSOPO_CREDITS_ENFORCED` is set, and the charge
+  helpers are no-ops when it is False.
+
+Hosted plans map to a monthly grant (`ai_generations_per_month +
+ai_media_per_month`), topped up lazily on first charge in a new period rather
+than by a scheduled job. `usage_records` still carries analytics: usage is a
+counter that may be reset, the ledger is an audit trail that may not.
 
 ### B3 · Hierarchical credit allocation — P1, M (needs B1 + B2)
 Org can allocate credits to workspaces or directly to users; a workspace can

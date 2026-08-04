@@ -285,6 +285,32 @@ def setup_database() -> None:
         add_table_column(connection, "workspaces", "billing_subscription_id", "TEXT")
         # Nullable: existing and personal workspaces stay outside any organization.
         add_table_column(connection, "workspaces", "organization_id", "INTEGER")
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS credit_accounts (
+                id %s,
+                owner_type TEXT NOT NULL,
+                owner_id INTEGER NOT NULL,
+                balance INTEGER NOT NULL DEFAULT 0,
+                granted_period TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(owner_type, owner_id)
+            )""" % id_column
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS credit_transactions (
+                id %s,
+                account_id INTEGER NOT NULL,
+                delta INTEGER NOT NULL,
+                balance_after INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                actor_user_id INTEGER,
+                reference TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(account_id) REFERENCES credit_accounts(id)
+            )""" % id_column
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS credit_transactions_account ON credit_transactions(account_id, id)")
         connection.execute("CREATE INDEX IF NOT EXISTS organization_memberships_user ON organization_memberships(user_id)")
         connection.execute("CREATE INDEX IF NOT EXISTS workspaces_organization ON workspaces(organization_id)")
         connection.execute("CREATE INDEX IF NOT EXISTS posts_workspace ON posts(workspace_id, state)")

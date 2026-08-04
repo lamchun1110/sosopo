@@ -18,6 +18,7 @@ try:  # package import (tests, `python -m app.server`)
     from ..errors import ProviderError
     from ..media_jobs import default_media_model
     from ..media_storage import detected_image_type, inspect_image, store_media
+    from ..credits import charge_ai_credit
     from ..plans import enforce_monthly_quota, enforce_storage_limit, record_usage
     from ..workspaces import workspace_role_allows
 except ImportError:  # script import (`python /app/app/server.py`)
@@ -28,6 +29,7 @@ except ImportError:  # script import (`python /app/app/server.py`)
     from errors import ProviderError
     from media_jobs import default_media_model
     from media_storage import detected_image_type, inspect_image, store_media
+    from credits import charge_ai_credit
     from plans import enforce_monthly_quota, enforce_storage_limit, record_usage
     from workspaces import workspace_role_allows
 
@@ -103,6 +105,7 @@ class MediaRoutes:
                 self._json({"error": f"{provider} has no supported {kind} model in Sosopo. Choose another provider or set a model explicitly."}, HTTPStatus.BAD_REQUEST); return True
             with db() as connection:
                 enforce_monthly_quota(connection, workspace_id, "ai_media", "ai_media_per_month", "AI media generations")
+                charge_ai_credit(connection, workspace_id, "ai_media", session["user_id"])
                 record_usage(connection, workspace_id, "ai_media")
                 job_id = insert_id(connection,
                     "INSERT INTO media_jobs (workspace_id, user_id, kind, prompt, aspect_ratio, style, provider, model, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
