@@ -53,6 +53,7 @@ MAX_IMAGE_PIXELS = 25_000_000
 
 
 MAX_POST_MEDIA = 10
+MAX_ALT_TEXT_LENGTH = 1_000
 
 
 MAX_ATTEMPTS = 3
@@ -100,7 +101,7 @@ IMAGE_TYPES = {"image/gif": ".gif", "image/jpeg": ".jpg", "image/png": ".png", "
 CHANNEL_CHARACTER_LIMITS = {"Facebook": 5_000, "Instagram": 2_200, "Threads": 500, "X": 280, "Telegram": 4_096, "Discord": 2_000, "LinkedIn": 3_000}
 
 
-CHANNEL_MEDIA_LIMITS = {"Facebook": 10, "Instagram": 10, "Threads": 10, "X": 4, "Telegram": 10, "Discord": 10, "LinkedIn": 0}
+CHANNEL_MEDIA_LIMITS = {"Facebook": 10, "Instagram": 10, "Threads": 10, "X": 4, "Telegram": 10, "Discord": 10, "LinkedIn": 9}
 
 
 WORKSPACE_ROLES = ("owner", "admin", "editor", "viewer")

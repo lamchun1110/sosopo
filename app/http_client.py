@@ -123,3 +123,25 @@ def telegram_request(token: str, method: str, fields: dict[str, str], image: Pat
     if not response.get("ok"):
         raise ProviderError(f"Telegram rejected the post: {response.get('description', 'unknown error')}")
     return response
+
+
+def request_put_bytes(url: str, content: bytes, headers: dict[str, str] | None = None) -> dict[str, Any]:
+    """Upload raw bytes to a provider-issued upload slot.
+
+    Providers that hand out a one-time upload URL (LinkedIn images) expect the
+    bytes as the whole request body, with no multipart wrapper.
+    """
+    request = Request(url, data=content, method="PUT", headers=headers or {})
+    try:
+        with urlopen(request, timeout=120) as response:
+            body = response.read() or b"{}"
+    except HTTPError as error:
+        raise ProviderError(f"Provider rejected the media upload ({error.code}): {error.read().decode(errors='replace')[:500]}",
+                            retryable=error.code == HTTPStatus.TOO_MANY_REQUESTS or error.code >= HTTPStatus.INTERNAL_SERVER_ERROR) from error
+    except URLError as error:
+        raise ProviderError(f"Provider media upload could not be completed: {error.reason}", retryable=True) from error
+    try:
+        result = json.loads(body)
+    except json.JSONDecodeError:
+        return {}
+    return result if isinstance(result, dict) else {}

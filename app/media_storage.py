@@ -110,6 +110,27 @@ def media_bytes(image_url: str) -> bytes:
     return media_client().get_object(Bucket=bucket, Key=media_key(Path(urlparse(image_url).path).name))["Body"].read()
 
 
+def post_media_items(post: dict[str, Any]) -> list[dict[str, str]]:
+    """Ordered attachments with their alt text.
+
+    Accepts a pre-resolved ``media_items`` list so a caller that already has
+    the rows does not re-read them, and falls back to the old single-image
+    ``image_url`` shape for posts created before multi-image support.
+    """
+    items = post.get("media_items")
+    if isinstance(items, list):
+        return [{"url": str(item.get("url", "")), "alt_text": str(item.get("alt_text") or "")} for item in items]
+    urls = post.get("media_urls")
+    if isinstance(urls, list):
+        return [{"url": str(url), "alt_text": ""} for url in urls]
+    if "id" not in post:
+        return [{"url": post["image_url"], "alt_text": ""}] if post.get("image_url") else []
+    with db() as connection:
+        rows = connection.execute("SELECT media_url, alt_text FROM post_media WHERE post_id = ? ORDER BY position", (post["id"],)).fetchall()
+    resolved = [{"url": row["media_url"], "alt_text": str(row["alt_text"] or "")} for row in rows]
+    return resolved or ([{"url": post["image_url"], "alt_text": ""}] if post.get("image_url") else [])
+
+
 def post_media_urls(post: dict[str, Any]) -> list[str]:
     """Return ordered attachments while retaining compatibility with old single-image posts."""
     urls = post.get("media_urls")

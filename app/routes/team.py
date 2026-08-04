@@ -73,7 +73,9 @@ class TeamRoutes:
                 members = [dict(row) for row in connection.execute("SELECT users.username, workspace_memberships.role, workspace_memberships.invite_state, workspace_memberships.created_at FROM workspace_memberships JOIN users ON users.id = workspace_memberships.user_id WHERE workspace_memberships.workspace_id = ?", (workspace_id,)).fetchall()]
                 posts = [dict(row) for row in connection.execute("SELECT * FROM posts WHERE workspace_id = ? ORDER BY id", (workspace_id,)).fetchall()]
                 for post in posts:
-                    post["media_urls"] = [row["media_url"] for row in connection.execute("SELECT media_url FROM post_media WHERE post_id = ? ORDER BY position", (post["id"],)).fetchall()]
+                    attachments = [dict(row) for row in connection.execute("SELECT media_url, alt_text FROM post_media WHERE post_id = ? ORDER BY position", (post["id"],)).fetchall()]
+                    post["media_urls"] = [row["media_url"] for row in attachments]
+                    post["media"] = [{"url": row["media_url"], "alt_text": row["alt_text"] or ""} for row in attachments]
                 accounts = [dict(row) for row in connection.execute("SELECT id, provider, external_account_id, display_name, token_expires_at, is_active, created_at FROM connections WHERE workspace_id = ? ORDER BY id", (workspace_id,)).fetchall()]
                 deliveries = [dict(row) for row in connection.execute("SELECT deliveries.* FROM deliveries JOIN posts ON posts.id = deliveries.post_id WHERE posts.workspace_id = ? ORDER BY deliveries.id", (workspace_id,)).fetchall()]
             audit(session["user_id"], "workspace.exported", "workspace", workspace_id, "Exported workspace data", self._source_ip(), workspace_id=workspace_id)

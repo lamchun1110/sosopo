@@ -16,23 +16,23 @@ try:  # package import (tests, `python -m app.server`)
     from . import config as cfg
     from . import http_client
     from .audit import cleanup_expired_records
-    from .config import CHANNELS, CHANNEL_CHARACTER_LIMITS, CHANNEL_MEDIA_LIMITS, LOGGER, MAX_ATTEMPTS, POLL_SECONDS, PUBLISHING_LEASE_SECONDS, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS, TOKEN_REFRESH_INTERVAL_SECONDS, WORKER_HEARTBEAT_SECONDS, config, now
+    from .config import CHANNELS, MAX_ALT_TEXT_LENGTH, CHANNEL_CHARACTER_LIMITS, CHANNEL_MEDIA_LIMITS, LOGGER, MAX_ATTEMPTS, POLL_SECONDS, PUBLISHING_LEASE_SECONDS, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS, TOKEN_REFRESH_INTERVAL_SECONDS, WORKER_HEARTBEAT_SECONDS, config, now
     from .connections import refresh_expiring_connection_tokens, token_is_expired
     from .database import db
     from .errors import ProviderError
     from .media_jobs import media_worker
-    from .media_storage import media_bytes, post_media_urls, public_image_url, storage_backend
+    from .media_storage import media_bytes, post_media_items, public_image_url, storage_backend
     from .security import decrypt_secrets
 except ImportError:  # script import (`python /app/app/server.py`)
     import config as cfg
     import http_client
     from audit import cleanup_expired_records
-    from config import CHANNELS, CHANNEL_CHARACTER_LIMITS, CHANNEL_MEDIA_LIMITS, LOGGER, MAX_ATTEMPTS, POLL_SECONDS, PUBLISHING_LEASE_SECONDS, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS, TOKEN_REFRESH_INTERVAL_SECONDS, WORKER_HEARTBEAT_SECONDS, config, now
+    from config import CHANNELS, MAX_ALT_TEXT_LENGTH, CHANNEL_CHARACTER_LIMITS, CHANNEL_MEDIA_LIMITS, LOGGER, MAX_ATTEMPTS, POLL_SECONDS, PUBLISHING_LEASE_SECONDS, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS, TOKEN_REFRESH_INTERVAL_SECONDS, WORKER_HEARTBEAT_SECONDS, config, now
     from connections import refresh_expiring_connection_tokens, token_is_expired
     from database import db
     from errors import ProviderError
     from media_jobs import media_worker
-    from media_storage import media_bytes, post_media_urls, public_image_url, storage_backend
+    from media_storage import media_bytes, post_media_items, public_image_url, storage_backend
     from security import decrypt_secrets
 
 
@@ -62,7 +62,9 @@ def provider_status(channel: str) -> str:
 
 def publish(post: dict[str, Any], account: dict[str, Any] | None = None) -> str:
     channel = str(account.get("provider") or post["channel"]) if account else post["channel"]
-    body, image_urls = post["body"], post_media_urls(post)
+    body, media_items = post["body"], post_media_items(post)
+    image_urls = [item["url"] for item in media_items]
+    alt_texts = {item["url"]: item["alt_text"] for item in media_items}
     image_url = image_urls[0] if image_urls else None
     if account and token_is_expired(account.get("token_expires_at")):
         raise ProviderError("This provider account token has expired. Reconnect or rotate it before publishing.")
@@ -84,16 +86,34 @@ def publish(post: dict[str, Any], account: dict[str, Any] | None = None) -> str:
             raise ProviderError("LinkedIn needs LINKEDIN_AUTHOR_URN, LINKEDIN_ACCESS_TOKEN, and LINKEDIN_API_VERSION.")
         if not author.startswith("urn:li:"):
             raise ProviderError("LinkedIn author must be a member or organization URN.", retryable=False)
-        if image_urls:
-            raise ProviderError("LinkedIn image publishing is not available yet; publish text only.", retryable=False)
-        result = http_client.request_json("https://api.linkedin.com/rest/posts", {
+        headers = {"Authorization": f"Bearer {token}", "LinkedIn-Version": version, "X-Restli-Protocol-Version": "2.0.0"}
+        # LinkedIn member images are a three-step flow: ask for an upload slot,
+        # PUT the bytes to the returned URL, then reference the image URN.
+        images = []
+        for url in image_urls:
+            slot = http_client.request_json("https://api.linkedin.com/rest/images?action=initializeUpload",
+                                            {"initializeUploadRequest": {"owner": author}}, headers).get("value", {})
+            upload_url, image_urn = str(slot.get("uploadUrl") or ""), str(slot.get("image") or "")
+            if not upload_url or not image_urn:
+                raise ProviderError("LinkedIn did not return an image upload slot.")
+            http_client.request_put_bytes(upload_url, media_bytes(url), {"Authorization": f"Bearer {token}"})
+            entry = {"id": image_urn}
+            if alt_texts.get(url):
+                entry["altText"] = alt_texts[url][:MAX_ALT_TEXT_LENGTH]
+            images.append(entry)
+        payload = {
             "author": author,
             "commentary": body,
             "visibility": "PUBLIC",
             "distribution": {"feedDistribution": "MAIN_FEED", "targetEntities": [], "thirdPartyDistributionChannels": []},
             "lifecycleState": "PUBLISHED",
             "isReshareDisabledByAuthor": False,
-        }, {"Authorization": f"Bearer {token}", "LinkedIn-Version": version, "X-Restli-Protocol-Version": "2.0.0"})
+        }
+        if len(images) == 1:
+            payload["content"] = {"media": images[0]}
+        elif images:
+            payload["content"] = {"multiImage": {"images": images}}
+        result = http_client.request_json("https://api.linkedin.com/rest/posts", payload, headers)
         return str(result.get("id") or "linkedin-posted")
     if channel == "Telegram":
         token, chat_id = credential("bot_token", "TELEGRAM_BOT_TOKEN"), account_id or credential("chat_id", "TELEGRAM_CHAT_ID")
@@ -122,6 +142,10 @@ def publish(post: dict[str, Any], account: dict[str, Any] | None = None) -> str:
             media_ids.append(str(result.get("data", {}).get("id") or result.get("data", {}).get("media_id") or ""))
             if not media_ids[-1]:
                 raise ProviderError("X did not return a media ID.")
+            if alt_texts.get(url):
+                http_client.request_json("https://api.x.com/2/media/metadata",
+                                         {"id": media_ids[-1], "alt_text": {"text": alt_texts[url][:MAX_ALT_TEXT_LENGTH]}},
+                                         {"Authorization": f"Bearer {token}"})
         result = http_client.request_json("https://api.x.com/2/tweets", {"text": body, **({"media": {"media_ids": media_ids}} if media_ids else {})}, {"Authorization": f"Bearer {token}"})
         return str(result.get("data", {}).get("id") or "")
     if channel == "Facebook":
@@ -132,7 +156,7 @@ def publish(post: dict[str, Any], account: dict[str, Any] | None = None) -> str:
         if len(image_urls) > 1:
             fields = {"access_token": token, "message": body}
             for index, url in enumerate(image_urls):
-                photo = http_client.request_form(f"{base}/{page_id}/photos", {"access_token": token, "url": public_image_url(url), "published": "false"})
+                photo = http_client.request_form(f"{base}/{page_id}/photos", {"access_token": token, "url": public_image_url(url), "published": "false", **({"alt_text_custom": alt_texts[url][:MAX_ALT_TEXT_LENGTH]} if alt_texts.get(url) else {})})
                 media_id = str(photo.get("id") or "")
                 if not media_id:
                     raise ProviderError("Facebook did not upload a carousel image.")
@@ -143,6 +167,8 @@ def publish(post: dict[str, Any], account: dict[str, Any] | None = None) -> str:
             fields = {"access_token": token, "caption" if image_url else "message": body}
             if image_url:
                 fields["url"] = public_image_url(image_url)
+                if alt_texts.get(image_url):
+                    fields["alt_text_custom"] = alt_texts[image_url][:MAX_ALT_TEXT_LENGTH]
             result = http_client.request_form(endpoint, fields)
         return str(result.get("post_id") or result.get("id") or "")
     if channel == "Instagram":

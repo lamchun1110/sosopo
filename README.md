@@ -117,6 +117,12 @@ Editors can turn a brief into a set of posts in the **Plan with AI** tab: a camp
 
 Planned posts are never scheduled or published automatically. The model's proposed time is stored as a suggestion only; turning it into a real schedule stays the existing manual flow, so a bad plan can never reach an audience. A plan that cannot be parsed strictly creates nothing at all — one unusable draft rejects the whole response, and the campaign, its drafts, and its credit charges are written in a single transaction. Each generated draft costs one AI credit.
 
+### Images and alt text
+
+Every attached image accepts **alt text** in the composer. It is stored with the attachment, included in the workspace export, and delivered wherever the provider supports it: X `media/metadata`, Facebook `alt_text_custom`, and LinkedIn's image `altText`. Alt text is optional and capped at 1,000 characters.
+
+**LinkedIn image publishing** is supported (previously text-only). Sosopo runs LinkedIn's three-step member image flow — initialize an upload slot, PUT the bytes, then reference the returned image URN — and posts a single image as `content.media` or several as `content.multiImage`. The per-post limit is 9 images.
+
 ### Brand voice
 
 Each workspace can save a **brand voice** profile in the AI providers tab: tone, audience, preferred and forbidden phrases, example posts, default hashtags, and a visual style. Workspace admins edit it; editors see it. Sosopo adds the profile as labelled context to the system prompt for generated copy, and appends the visual style to generated media prompts. The composer shows an **Apply brand voice** toggle, on by default whenever a profile exists, so a one-off post can ignore it.

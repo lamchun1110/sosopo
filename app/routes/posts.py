@@ -9,7 +9,7 @@ from typing import Any
 
 try:  # package import (tests, `python -m app.server`)
     from ..audit import audit
-    from ..config import CHANNELS, MAX_POST_MEDIA, now, timezone_name
+    from ..config import CHANNELS, MAX_ALT_TEXT_LENGTH, MAX_POST_MEDIA, now, timezone_name
     from ..database import Record, db, insert_id
     from ..errors import ProviderError
     from ..media_storage import media_exists
@@ -18,7 +18,7 @@ try:  # package import (tests, `python -m app.server`)
     from ..publishing import delete_published_content, provider_status, validate_post
 except ImportError:  # script import (`python /app/app/server.py`)
     from audit import audit
-    from config import CHANNELS, MAX_POST_MEDIA, now, timezone_name
+    from config import CHANNELS, MAX_ALT_TEXT_LENGTH, MAX_POST_MEDIA, now, timezone_name
     from database import Record, db, insert_id
     from errors import ProviderError
     from media_storage import media_exists
@@ -45,7 +45,9 @@ class PostRoutes:
             with db() as connection:
                 posts = [dict(row) for row in connection.execute("SELECT * FROM posts WHERE workspace_id = ? ORDER BY CASE state WHEN 'scheduled' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, scheduled_for, id DESC", (workspace_id,)).fetchall()]
                 for post in posts:
-                    post["media_urls"] = [row["media_url"] for row in connection.execute("SELECT media_url FROM post_media WHERE post_id = ? ORDER BY position", (post["id"],)).fetchall()] or ([post["image_url"]] if post.get("image_url") else [])
+                    attachments = [dict(row) for row in connection.execute("SELECT media_url, alt_text FROM post_media WHERE post_id = ? ORDER BY position", (post["id"],)).fetchall()]
+                    post["media_urls"] = [row["media_url"] for row in attachments] or ([post["image_url"]] if post.get("image_url") else [])
+                    post["media"] = [{"url": row["media_url"], "alt_text": row["alt_text"] or ""} for row in attachments]
             self._json({"posts": posts, "providers": [{"name": channel, "status": provider_status(channel), "oauth_available": social_oauth_enabled(channel)} for channel in CHANNELS]})
             return True
         if path.startswith("/api/posts/") and path.endswith("/deliveries"):
@@ -84,6 +86,12 @@ class PostRoutes:
             if not isinstance(image_urls, list) or any(not isinstance(url, str) or not url.strip() for url in image_urls):
                 self._json({"error": "image_urls must be an array of uploaded image URLs."}, HTTPStatus.BAD_REQUEST); return True
             image_urls = list(dict.fromkeys(url.strip() for url in image_urls))
+            alt_texts = payload.get("image_alt_texts") or []
+            if not isinstance(alt_texts, list) or any(not isinstance(item, str) for item in alt_texts):
+                self._json({"error": "image_alt_texts must be an array of strings."}, HTTPStatus.BAD_REQUEST); return True
+            if any(len(item) > MAX_ALT_TEXT_LENGTH for item in alt_texts):
+                self._json({"error": f"Alt text must be {MAX_ALT_TEXT_LENGTH} characters or fewer."}, HTTPStatus.BAD_REQUEST); return True
+            alt_by_url = {url: alt_texts[index].strip() for index, url in enumerate(image_urls) if index < len(alt_texts) and alt_texts[index].strip()}
             image_url = image_urls[0] if image_urls else None
             target_ids = payload.get("connection_ids", [])
             if not body or any(channel not in CHANNELS for channel in channels):
@@ -116,7 +124,7 @@ class PostRoutes:
                 for target_id in dict.fromkeys(target_ids):
                     connection.execute("INSERT INTO post_targets (post_id, connection_id) VALUES (?, ?)", (post_id, target_id))
                 for position, url in enumerate(image_urls):
-                    connection.execute("INSERT INTO post_media (post_id, media_url, position) VALUES (?, ?, ?)", (post_id, url, position))
+                    connection.execute("INSERT INTO post_media (post_id, media_url, alt_text, position) VALUES (?, ?, ?, ?)", (post_id, url, alt_by_url.get(url) or None, position))
                 row = dict(connection.execute("SELECT * FROM posts WHERE id = ?", (post_id,)).fetchone())
             row["media_urls"] = image_urls
             audit(session["user_id"], "post.created", "post", post_id, f"Created {'/'.join(channels)} post", self._source_ip(), workspace_id=workspace_id)

@@ -40,8 +40,9 @@ class SosopoTest(unittest.TestCase):
         s = self.server
         s.validate_post("Discord", "hello", None)
         s.validate_post("LinkedIn", "hello", None)
-        with self.assertRaisesRegex(ValueError, "LinkedIn supports up to 0 images"):
-            s.validate_post("LinkedIn", "hello", "/uploads/image.png", 1)
+        s.validate_post("LinkedIn", "hello", "/uploads/image.png", 1)
+        with self.assertRaisesRegex(ValueError, f"LinkedIn supports up to {s.CHANNEL_MEDIA_LIMITS['LinkedIn']} images"):
+            s.validate_post("LinkedIn", "hello", "/uploads/image.png", s.CHANNEL_MEDIA_LIMITS["LinkedIn"] + 1)
 
     def test_discord_publish_uses_encrypted_webhook_connection(self) -> None:
         s = self.server

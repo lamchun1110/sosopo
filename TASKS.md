@@ -27,7 +27,7 @@ All six phases of ROADMAP.md are complete and deployed:
 - `GET /api/workspaces/status` dashboard data, audited metadata-only
   `GET /api/admin/workspaces`, media/workspace Prometheus gauges (Phase 6).
 
-Suite: 238 tests, all passing (1 skipped without PyYAML).
+Suite: 249 tests, all passing (1 skipped without PyYAML).
 
 `app/` is split into focused modules (A1). Dependency order, which is also the
 reload order in `app/server.py`: `errors` → `config` → `database` → `security`
@@ -50,7 +50,7 @@ Two conventions exist because the test suite calls
 - `app/server.py` reloads every sibling in dependency order, and the handful of
   names tests replace by assignment (`request_json`, `request_form`,
   `request_get_json`, `request_get_bytes`, `request_delete`,
-  `telegram_request`, `publish`, `stripe_request`, `PyJWKClient`,
+  `telegram_request`, `request_put_bytes`, `publish`, `stripe_request`, `PyJWKClient`,
   `VIDEO_POLL_SECONDS`) are
   **absent** from `app/server.py`'s own namespace. `_SEAMS` plus the `_Facade`
   module type forward reads and writes to the module that defines them, so a
@@ -61,7 +61,7 @@ Two conventions exist because the test suite calls
   reload list, and no module exceeds 800 lines. Reload-order mistakes
   otherwise pass tests silently.
 
-Other key files: `app/index.html` (single-page portal), `tests/` (nineteen files;
+Other key files: `app/index.html` (single-page portal), `tests/` (twenty files;
 `test_workspaces.py` exports the `WorkspaceHttpCase` live-HTTP harness),
 `docs/index.html` + `docs/openapi.yaml` (separate docs site), `scripts/`
 (backup/restore/preflight).
@@ -402,14 +402,18 @@ self-hosted installs do not have.
 
 ## E. Publishing depth (Postiz parity)
 
-### E1 · LinkedIn image publishing — P1, M
-LinkedIn is text-only today (`publish()` rejects images). Implement the
-member-image flow: register upload (`POST /rest/images?action=initializeUpload`),
-PUT the bytes, attach the image URN to the post payload. Respect
-`CHANNEL_MEDIA_LIMITS` (raise LinkedIn from 0 to its real limit) and update
-validation, README, and docs.
-**Accept:** mocked-HTTP test covering initialize/upload/post sequence and
-error paths; text-only posts unchanged.
+### E1 · LinkedIn image publishing — **done**
+The three-step member image flow: `POST /rest/images?action=initializeUpload`
+for a slot, PUT the bytes to the returned `uploadUrl`, then reference the
+image URN. One image posts as `content.media`, several as
+`content.multiImage`. `CHANNEL_MEDIA_LIMITS["LinkedIn"]` went 0 → 9.
+
+New `http_client.request_put_bytes` (a `_SEAMS` entry) exists because a
+provider-issued upload slot wants raw bytes as the whole body, with no
+multipart wrapper.
+
+One existing test asserted "LinkedIn supports up to 0 images"; it encoded the
+limitation this task removes and was updated to assert the real limit.
 
 ### E2 · Publish approved library videos — P2, L
 Media studio produces videos, but posts only attach images. Start narrow:
@@ -421,12 +425,16 @@ ROADMAP, do not attempt in this task.
 **Accept:** validation rejects videos on unsupported channels with clear
 messages; delivery tests with mocked providers; moderation gate still applies.
 
-### E3 · Alt text end-to-end — P2, S/M
-`post_media.alt_text` exists but is unused. Add alt-text inputs per attached
-image in the composer, store it, and send it where providers support it
-(X `media/metadata`, Facebook `alt_text_custom`, LinkedIn image alt). Include
-alt text in workspace export.
-**Accept:** persisted + delivered in mocked provider payloads; export test.
+### E3 · Alt text end-to-end — **done**
+`post_media.alt_text` was written but never used. The composer now shows an
+alt-text input under every attached image; `POST /api/posts` takes
+`image_alt_texts` (positional, optional, ≤1,000 chars); the dashboard and the
+workspace export both return it.
+
+Delivered wherever the provider supports it: X `media/metadata`, Facebook
+`alt_text_custom`, LinkedIn image `altText`. `post_media_items()` replaces
+`post_media_urls()` inside `publish()` so alt text travels with its URL rather
+than being looked up separately.
 
 ### E4 · Post-performance ingestion — P2, L
 Pull basic metrics for published posts where the connected credential allows

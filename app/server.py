@@ -285,6 +285,7 @@ _SEAMS = {
     "request_get_json": "http_client",
     "request_get_bytes": "http_client",
     "request_delete": "http_client",
+    "request_put_bytes": "http_client",
     "telegram_request": "http_client",
     "publish": "publishing",
     "stripe_request": "billing",
