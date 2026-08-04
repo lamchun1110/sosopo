@@ -208,3 +208,22 @@ def generate_post_copy(provider: str, model: str, instruction: str, draft: str, 
     adapter = AI_PROVIDERS[provider].adapter
     endpoint, payload, headers = adapter.build_chat_request(settings, messages, {"model": selected_model, "temperature": 0.7, "max_tokens": 700})
     return adapter.parse_chat_response(http_client.request_json(endpoint, payload, headers))
+
+
+def generate_campaign_plan(provider: str, model: str, prompt: str, workspace_id: int | None = None, brand_voice: dict | None = None) -> str:
+    """Ask one provider for a content plan and return its raw text reply.
+
+    Parsing lives in :mod:`app.campaigns`: this function only owns the request.
+    """
+    settings = ai_provider_settings(provider, workspace_id)
+    selected_model = model.strip() or settings["model"]
+    stored, _ = effective_ai_provider_stored(provider, workspace_id)
+    catalog = ai_model_catalog(stored)
+    if catalog and selected_model not in catalog:
+        raise ProviderError("Choose a model from the provider's refreshed model catalog.", retryable=False)
+    instructions = "You are Sosopo's social-media campaign planner. Return only valid JSON in the requested shape; never add commentary or a markdown fence."
+    voice = brand_voice_prompt(brand_voice)
+    messages = [{"role": "system", "content": f"{instructions}\n\n{voice}" if voice else instructions}, {"role": "user", "content": prompt}]
+    adapter = AI_PROVIDERS[provider].adapter
+    endpoint, payload, headers = adapter.build_chat_request(settings, messages, {"model": selected_model, "temperature": 0.6, "max_tokens": 4_000})
+    return adapter.parse_chat_response(http_client.request_json(endpoint, payload, headers))

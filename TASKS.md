@@ -27,12 +27,12 @@ All six phases of ROADMAP.md are complete and deployed:
 - `GET /api/workspaces/status` dashboard data, audited metadata-only
   `GET /api/admin/workspaces`, media/workspace Prometheus gauges (Phase 6).
 
-Suite: 210 tests, all passing (1 skipped without PyYAML).
+Suite: 225 tests, all passing (1 skipped without PyYAML).
 
 `app/` is split into focused modules (A1). Dependency order, which is also the
 reload order in `app/server.py`: `errors` → `config` → `database` → `security`
 → `http_client` → `audit` → `workspaces` → `plans` → `billing` →
-`invitations` → `organizations` → `credits` → `brand_voice` → `media_storage` → `ai_adapters` → `ai_providers` →
+`invitations` → `organizations` → `credits` → `brand_voice` → `campaigns` → `media_storage` → `ai_adapters` → `ai_providers` →
 `media_jobs` → `oauth` → `connections` → `schema` → `publishing`.
 `app/routes/` then holds the ten HTTP route-family mixins (A1b, B1), which import
 from the modules above and are reloaded after them. `app/server.py` holds the
@@ -57,7 +57,7 @@ Two conventions exist because the test suite calls
   test replacement is visible to every caller. Add a new patchable seam to
   `_SEAMS`, never to the re-export block.
 
-Other key files: `app/index.html` (single-page portal), `tests/` (sixteen files;
+Other key files: `app/index.html` (single-page portal), `tests/` (seventeen files;
 `test_workspaces.py` exports the `WorkspaceHttpCase` live-HTTP harness),
 `docs/index.html` + `docs/openapi.yaml` (separate docs site), `scripts/`
 (backup/restore/preflight).
@@ -329,17 +329,25 @@ instructions.
 
 Generation with no profile is byte-for-byte unchanged — there is a test.
 
-### D2 · AI content calendar generation — P1, L (better after D1)
-"Plan my week": editor supplies a brief, cadence, and target channels; the AI
-returns N post drafts with proposed local schedule times; Sosopo creates them
-as **drafts** (state `draft`, never auto-scheduled or published) tagged in a
-new `campaigns` table (id, workspace, name, brief, created_by) with
-`posts.campaign_id` nullable column. UI: a "Plan with AI" panel that lists the
-generated drafts for review; scheduling stays the existing manual flow.
-Charge one AI credit per generated draft.
-**Accept:** drafts land unscheduled and workspace-scoped; malformed AI output
-degrades to an error, never partial junk (parse strictly, insert
-transactionally); quota/credit tests.
+### D2 · AI content calendar generation — **done**
+`POST /api/campaigns` (editor+) turns a brief, cadence, channels, and a count
+(≤14) into drafts; `GET /api/campaigns` lists them with draft counts. New
+`campaigns` table plus nullable `posts.campaign_id` and `posts.suggested_for`.
+UI is the **Plan with AI** tab. Brand voice (D1) applies to planning too.
+
+Two properties this task exists to guarantee, both tested:
+
+- **A plan never schedules or publishes.** Drafts land `state='draft'` with
+  `scheduled_for NULL`; the model's proposed time goes to `suggested_for`,
+  which *nothing acts on*. Turning a suggestion into a schedule stays the
+  manual flow, so a bad plan cannot reach an audience.
+- **A malformed plan creates nothing.** `parse_campaign_plan` is strict — one
+  unusable draft rejects the whole response — and the credits, campaign, and
+  drafts are written in one transaction, so there is no partial calendar.
+
+Ordering in the route is deliberate: validate → call the provider → parse →
+*then* one transaction that charges one credit per draft and writes
+everything. A plan that fails to parse is never charged for.
 
 ### D3 · AI analytics summarization — P2, M
 `POST /api/workspaces/summary` (admin+): feed `GET /api/workspaces/status`

@@ -31,12 +31,12 @@ from zoneinfo import ZoneInfo
 # it depends on have themselves been reloaded.
 _SUBMODULES = (
     "errors", "config", "database", "security", "http_client", "audit", "workspaces", "plans",
-    "invitations", "organizations", "credits", "billing", "brand_voice", "media_storage", "ai_adapters", "ai_providers", "media_jobs", "oauth",
+    "invitations", "organizations", "credits", "billing", "brand_voice", "campaigns", "media_storage", "ai_adapters", "ai_providers", "media_jobs", "oauth",
     "connections", "schema",
     "publishing",
     # Route families last: each mixin imports from the modules above.
     "routes.public", "routes.connections", "routes.posts", "routes.ai", "routes.admin", "routes.media",
-    "routes.team", "routes.account", "routes.billing", "routes.organizations",
+    "routes.team", "routes.account", "routes.billing", "routes.organizations", "routes.campaigns",
 )
 _PACKAGE = __name__.rpartition(".")[0]
 
@@ -198,6 +198,10 @@ ai_provider_settings = _MODULES["ai_providers"].ai_provider_settings
 available_ai_providers = _MODULES["ai_providers"].available_ai_providers
 ai_provider_models = _MODULES["ai_providers"].ai_provider_models
 generate_post_copy = _MODULES["ai_providers"].generate_post_copy
+generate_campaign_plan = _MODULES["ai_providers"].generate_campaign_plan
+parse_campaign_plan = _MODULES["campaigns"].parse_campaign_plan
+planning_prompt = _MODULES["campaigns"].planning_prompt
+workspace_campaigns = _MODULES["campaigns"].workspace_campaigns
 
 default_media_model = _MODULES["media_jobs"].default_media_model
 media_job_prompt = _MODULES["media_jobs"].media_job_prompt
@@ -265,6 +269,7 @@ TeamRoutes = _MODULES["routes.team"].TeamRoutes
 AccountRoutes = _MODULES["routes.account"].AccountRoutes
 BillingRoutes = _MODULES["routes.billing"].BillingRoutes
 OrganizationRoutes = _MODULES["routes.organizations"].OrganizationRoutes
+CampaignRoutes = _MODULES["routes.campaigns"].CampaignRoutes
 
 
 # Tests replace outbound HTTP and the publish entry point by assigning to
@@ -316,6 +321,7 @@ class Handler(
     AccountRoutes,
     BillingRoutes,
     OrganizationRoutes,
+    CampaignRoutes,
     SimpleHTTPRequestHandler,
 ):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -454,7 +460,7 @@ class Handler(
             return
         if (self.get_connections(path) or self.get_posts(path) or self.get_ai(path)
                 or self.get_admin(path) or self.get_media(path) or self.get_team(path)
-                or self.get_organizations(path)):
+                or self.get_organizations(path) or self.get_campaigns(path)):
             return
         if path.startswith("/uploads/"):
             filename = Path(path).name
@@ -508,7 +514,8 @@ class Handler(
                     or self.post_team(path, payload, session) or self.post_media(path, payload, session)
                     or self.post_billing(path, payload, session) or self.post_admin(path, payload, session)
                     or self.post_connections(path, payload, session) or self.post_posts(path, payload, session)
-                    or self.post_organizations(path, payload, session)):
+                    or self.post_organizations(path, payload, session)
+                    or self.post_campaigns(path, payload, session)):
                 return
             self._json({"error": "Not found."}, HTTPStatus.NOT_FOUND)
         except (json.JSONDecodeError, ValueError) as error:

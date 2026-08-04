@@ -111,6 +111,12 @@ SOSOPO_AI_KIMI_BASE_URL=https://provider.example/v1
 SOSOPO_AI_KIMI_MODEL=your-model-id
 ```
 
+### Plan with AI
+
+Editors can turn a brief into a set of posts in the **Plan with AI** tab: a campaign name, a brief, an optional cadence, target platforms, and how many posts to plan (up to 14). Sosopo asks the configured provider for a plan and creates the result as **drafts**.
+
+Planned posts are never scheduled or published automatically. The model's proposed time is stored as a suggestion only; turning it into a real schedule stays the existing manual flow, so a bad plan can never reach an audience. A plan that cannot be parsed strictly creates nothing at all — one unusable draft rejects the whole response, and the campaign, its drafts, and its credit charges are written in a single transaction. Each generated draft costs one AI credit.
+
 ### Brand voice
 
 Each workspace can save a **brand voice** profile in the AI providers tab: tone, audience, preferred and forbidden phrases, example posts, default hashtags, and a visual style. Workspace admins edit it; editors see it. Sosopo adds the profile as labelled context to the system prompt for generated copy, and appends the visual style to generated media prompts. The composer shows an **Apply brand voice** toggle, on by default whenever a profile exists, so a one-off post can ignore it.

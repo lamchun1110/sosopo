@@ -313,6 +313,22 @@ def setup_database() -> None:
         connection.execute("CREATE INDEX IF NOT EXISTS credit_transactions_account ON credit_transactions(account_id, id)")
         add_table_column(connection, "media_jobs", "credit_account_id", "INTEGER")
         connection.execute(
+            """CREATE TABLE IF NOT EXISTS campaigns (
+                id %s,
+                workspace_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                brief TEXT NOT NULL DEFAULT '',
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(id),
+                FOREIGN KEY(created_by) REFERENCES users(id)
+            )""" % id_column
+        )
+        add_column(connection, "campaign_id", "INTEGER")
+        add_column(connection, "suggested_for", "TEXT")
+        connection.execute("CREATE INDEX IF NOT EXISTS campaigns_workspace ON campaigns(workspace_id, id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS posts_campaign ON posts(campaign_id)")
+        connection.execute(
             """CREATE TABLE IF NOT EXISTS billing_events (
                 event_id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL

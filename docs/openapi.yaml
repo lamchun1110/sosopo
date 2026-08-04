@@ -152,6 +152,19 @@ paths:
       responses:
         '200': { description: Success. }
         default: { $ref: '#/components/responses/Error' }
+  /api/campaigns:
+    get:
+      summary: AI-planned campaigns for the active workspace, with draft counts.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      summary: Plan a brief into reviewable drafts. Spends one AI credit per draft.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
   /api/connections:
     get:
       summary: Connected provider accounts, with health, for the active workspace.
