@@ -28,12 +28,13 @@ def workspace_slug(connection: Database, name: str) -> str:
     return slug
 
 
-def create_workspace(connection: Database, name: str, owner_user_id: int, plan: str | None = None) -> int:
+def create_workspace(connection: Database, name: str, owner_user_id: int, plan: str | None = None, organization_id: int | None = None) -> int:
+    """Create a workspace; organization_id is None for personal workspaces."""
     plan = plan or ("free" if deployment_mode() == "hosted" else "self_hosted")
     workspace_id = insert_id(
         connection,
-        "INSERT INTO workspaces (name, slug, owner_user_id, plan, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', ?, ?)",
-        (name, workspace_slug(connection, name), owner_user_id, plan, now(), now()),
+        "INSERT INTO workspaces (name, slug, owner_user_id, plan, status, organization_id, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
+        (name, workspace_slug(connection, name), owner_user_id, plan, organization_id, now(), now()),
     )
     connection.execute(
         "INSERT INTO workspace_memberships (workspace_id, user_id, role, invite_state, created_at, updated_at) VALUES (?, ?, 'owner', 'active', ?, ?)",

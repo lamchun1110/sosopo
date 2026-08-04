@@ -256,8 +256,37 @@ def setup_database() -> None:
         add_table_column(connection, "sessions", "active_workspace_id", "INTEGER")
         add_table_column(connection, "social_oauth_states", "workspace_id", "INTEGER")
         add_table_column(connection, "audit_events", "workspace_id", "INTEGER")
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS organizations (
+                id %s,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL UNIQUE,
+                owner_user_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(owner_user_id) REFERENCES users(id)
+            )""" % id_column
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS organization_memberships (
+                id %s,
+                organization_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(organization_id, user_id),
+                FOREIGN KEY(organization_id) REFERENCES organizations(id),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )""" % id_column
+        )
         add_table_column(connection, "workspaces", "billing_customer_id", "TEXT")
         add_table_column(connection, "workspaces", "billing_subscription_id", "TEXT")
+        # Nullable: existing and personal workspaces stay outside any organization.
+        add_table_column(connection, "workspaces", "organization_id", "INTEGER")
+        connection.execute("CREATE INDEX IF NOT EXISTS organization_memberships_user ON organization_memberships(user_id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS workspaces_organization ON workspaces(organization_id)")
         connection.execute("CREATE INDEX IF NOT EXISTS posts_workspace ON posts(workspace_id, state)")
         connection.execute("CREATE INDEX IF NOT EXISTS connections_workspace ON connections(workspace_id, provider)")
         connection.execute("CREATE INDEX IF NOT EXISTS workspace_memberships_user ON workspace_memberships(user_id)")

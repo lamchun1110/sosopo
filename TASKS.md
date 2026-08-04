@@ -27,14 +27,14 @@ All six phases of ROADMAP.md are complete and deployed:
 - `GET /api/workspaces/status` dashboard data, audited metadata-only
   `GET /api/admin/workspaces`, media/workspace Prometheus gauges (Phase 6).
 
-Suite: 106 tests, all passing.
+Suite: 121 tests, all passing.
 
 `app/` is split into focused modules (A1). Dependency order, which is also the
 reload order in `app/server.py`: `errors` → `config` → `database` → `security`
 → `http_client` → `audit` → `workspaces` → `plans` → `billing` →
-`invitations` → `media_storage` → `ai_adapters` → `ai_providers` →
+`invitations` → `organizations` → `media_storage` → `ai_adapters` → `ai_providers` →
 `media_jobs` → `oauth` → `connections` → `schema` → `publishing`.
-`app/routes/` then holds the nine HTTP route-family mixins (A1b), which import
+`app/routes/` then holds the ten HTTP route-family mixins (A1b, B1), which import
 from the modules above and are reloaded after them. `app/server.py` holds the
 `Handler` (dispatch, shared request helpers, static files), the entrypoint, and
 a hand-written re-export block that keeps `app.server` the one public namespace
@@ -56,7 +56,7 @@ Two conventions exist because the test suite calls
   test replacement is visible to every caller. Add a new patchable seam to
   `_SEAMS`, never to the re-export block.
 
-Other key files: `app/index.html` (single-page portal), `tests/` (seven files;
+Other key files: `app/index.html` (single-page portal), `tests/` (eight files;
 `test_workspaces.py` exports the `WorkspaceHttpCase` live-HTTP harness),
 `docs/index.html` (separate docs site), `scripts/`
 (backup/restore/preflight).
@@ -156,18 +156,23 @@ runtime deps), coverage test green, docs site links it.
 
 ## B. Organizations and the credit system
 
-### B1 · Organization layer above workspaces — P1, L
-CLAUDE.md's hierarchy is Organization → Team → User; today's workspaces are
-the "team" level. Add `organizations` (name, slug, owner, status, timestamps)
-and `organization_memberships` (user, org, role: `owner`/`admin`/`member`),
-plus nullable `workspaces.organization_id`. Personal workspaces stay
-org-less. Org admins can create workspaces inside the org and see an org
-workspace list; workspace-level roles keep governing content access.
-Migration: purely additive; nothing changes for existing installs until an
-org is created. UI: minimal — an "Organization" block in the Team tab.
-**Accept:** HTTP tests for org creation, org-scoped workspace listing, and
-isolation (non-members see nothing); migration idempotent on all 4 backends
-(pattern-level: SQLite tests + statement review).
+### B1 · Organization layer above workspaces — **done**
+`organizations` + `organization_memberships` (roles `owner`/`admin`/`member`)
+and a nullable `workspaces.organization_id`. `app/organizations.py` holds the
+domain helpers, `app/routes/organizations.py` the endpoints:
+`GET|POST /api/organizations`, `GET|POST /api/organizations/<id>/workspaces`,
+`GET|POST /api/organizations/<id>/members`. Minimal UI block in the Team tab.
+
+Two rules to keep in mind when building on this:
+
+- **Organization membership is administrative, not a content grant.** An org
+  owner still cannot read a workspace's posts; workspace membership and
+  workspace roles govern content. There is a regression test for this.
+- **Organizations a caller does not belong to answer 404, not 403**, so
+  membership is not discoverable by probing IDs.
+
+Personal workspaces keep `organization_id NULL`, and an installation that
+never creates an organization behaves exactly as before.
 
 ### B2 · Auditable AI credit ledger — P1, L
 CLAUDE.md: credits are consumed **only** by AI usage (text + media); posts,

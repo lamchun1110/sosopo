@@ -31,11 +31,12 @@ from zoneinfo import ZoneInfo
 # it depends on have themselves been reloaded.
 _SUBMODULES = (
     "errors", "config", "database", "security", "http_client", "audit", "workspaces", "plans", "billing",
-    "invitations", "media_storage", "ai_adapters", "ai_providers", "media_jobs", "oauth", "connections", "schema",
+    "invitations", "organizations", "media_storage", "ai_adapters", "ai_providers", "media_jobs", "oauth",
+    "connections", "schema",
     "publishing",
     # Route families last: each mixin imports from the modules above.
     "routes.public", "routes.connections", "routes.posts", "routes.ai", "routes.admin", "routes.media",
-    "routes.team", "routes.account", "routes.billing",
+    "routes.team", "routes.account", "routes.billing", "routes.organizations",
 )
 _PACKAGE = __name__.rpartition(".")[0]
 
@@ -244,6 +245,7 @@ MediaRoutes = _MODULES["routes.media"].MediaRoutes
 TeamRoutes = _MODULES["routes.team"].TeamRoutes
 AccountRoutes = _MODULES["routes.account"].AccountRoutes
 BillingRoutes = _MODULES["routes.billing"].BillingRoutes
+OrganizationRoutes = _MODULES["routes.organizations"].OrganizationRoutes
 
 
 # Tests replace outbound HTTP and the publish entry point by assigning to
@@ -293,6 +295,7 @@ class Handler(
     TeamRoutes,
     AccountRoutes,
     BillingRoutes,
+    OrganizationRoutes,
     SimpleHTTPRequestHandler,
 ):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -430,7 +433,8 @@ class Handler(
         if path.startswith("/api/") and self._require_auth() is None:
             return
         if (self.get_connections(path) or self.get_posts(path) or self.get_ai(path)
-                or self.get_admin(path) or self.get_media(path) or self.get_team(path)):
+                or self.get_admin(path) or self.get_media(path) or self.get_team(path)
+                or self.get_organizations(path)):
             return
         if path.startswith("/uploads/"):
             filename = Path(path).name
@@ -483,7 +487,8 @@ class Handler(
             if (self.post_ai(path, payload, session) or self.post_account(path, payload, session)
                     or self.post_team(path, payload, session) or self.post_media(path, payload, session)
                     or self.post_billing(path, payload, session) or self.post_admin(path, payload, session)
-                    or self.post_connections(path, payload, session) or self.post_posts(path, payload, session)):
+                    or self.post_connections(path, payload, session) or self.post_posts(path, payload, session)
+                    or self.post_organizations(path, payload, session)):
                 return
             self._json({"error": "Not found."}, HTTPStatus.NOT_FOUND)
         except (json.JSONDecodeError, ValueError) as error:
