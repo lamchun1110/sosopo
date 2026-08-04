@@ -142,14 +142,22 @@ Documented in README.md and `app/worker.py`.
 `tests/test_job_claiming.py` races four threads for the same row and asserts
 exactly one wins, for both posts and media jobs, plus lease recovery.
 
-### A3 · Extract portal JavaScript — P2, M
-`app/index.html` mixes markup and a large inline script. Move the script to
-`app/portal.js` served statically (CSP already allows `'self'`), split into
-logical sections (auth, composer, media, team, ai) with no framework and no
-build step. Keep behavior identical.
-**Accept:** manual smoke of sign-in/composer/media/team views; no console
-errors; CSP header unchanged except dropping `'unsafe-inline'` for scripts if
-feasible.
+### A3 · Extract portal JavaScript — **done**
+The inline script moved to `app/portal.js`, served statically and loaded with
+`defer`. `app/index.html` went from ~80 KB to ~30 KB and is now markup only.
+
+The real win is the header: `script-src` dropped `'unsafe-inline'`, so the CSP
+now forbids inline script outright. Keep it that way — any new behavior goes
+in `portal.js`, never in an inline `<script>` or an `onclick=` attribute.
+
+Deliberately **one** file with section banners rather than several: the script
+shares mutable state (`csrfToken`, `aiScope`, `activeOrganization`) across
+sections, and with no build step, splitting it would mean hanging that state
+on `window`, which is worse than the problem being solved.
+
+**Verified:** sign-in renders under the strict CSP with no console errors, and
+every `el('…')` target resolves to an id in the markup (checked mechanically).
+The authenticated views were not click-tested, since that needs credentials.
 
 ### A4 · OpenAPI description of the HTTP API — P2, M
 CLAUDE.md demands API-first design. Hand-write `docs/openapi.yaml` covering
