@@ -27,7 +27,7 @@ All six phases of ROADMAP.md are complete and deployed:
 - `GET /api/workspaces/status` dashboard data, audited metadata-only
   `GET /api/admin/workspaces`, media/workspace Prometheus gauges (Phase 6).
 
-Suite: 178 tests, all passing (1 skipped without PyYAML).
+Suite: 196 tests, all passing (1 skipped without PyYAML).
 
 `app/` is split into focused modules (A1). Dependency order, which is also the
 reload order in `app/server.py`: `errors` → `config` → `database` → `security`
@@ -57,7 +57,7 @@ Two conventions exist because the test suite calls
   test replacement is visible to every caller. Add a new patchable seam to
   `_SEAMS`, never to the re-export block.
 
-Other key files: `app/index.html` (single-page portal), `tests/` (fourteen files;
+Other key files: `app/index.html` (single-page portal), `tests/` (fifteen files;
 `test_workspaces.py` exports the `WorkspaceHttpCase` live-HTTP harness),
 `docs/index.html` + `docs/openapi.yaml` (separate docs site), `scripts/`
 (backup/restore/preflight).
@@ -277,27 +277,36 @@ adapter)` named tuples; `adapter` defaults to `ChatAdapter`, so **a provider
 that speaks the OpenAI shape needs one line in the registry and nothing
 else**. No call site branches on a provider name any more.
 
-### C2 · Anthropic Claude provider — P1, M (needs C1)
-Native Messages API: `POST {base}/v1/messages` with `x-api-key` +
-`anthropic-version` headers, `max_tokens` required, content blocks in the
-response; model list from `GET /v1/models`. Preset models: current Claude
-generation (e.g. `claude-sonnet-4-5`, check the docs current at
-implementation time). Works at both instance and workspace scope; key
-encrypted like all others.
-**Accept:** mocked-HTTP tests for request shape, auth header (never Bearer),
-response parsing, and model refresh; README/docs updated.
+### C2 · Anthropic Claude provider — **done**
+`ClaudeAdapter` speaks the native Messages API: `POST {base}/v1/messages`,
+`x-api-key` plus a pinned `anthropic-version` (**never** a bearer token — there
+is a test asserting that), the system prompt hoisted out of the message list
+into a top-level `system` field, required `max_tokens`, and a reply read from
+text content blocks. Model catalog from `GET {base}/v1/models` with the same
+headers, parsed by the shared rules.
 
-### C3 · Google Gemini provider — P1, S/M (needs C1)
-Use Gemini's OpenAI-compatible endpoint (`…/v1beta/openai/`) to reuse the
-default adapter; only base URL, key handling, and model presets differ.
-Verify model listing works through the compatible endpoint, otherwise adapt.
-**Accept:** same test coverage as C2.
+Presets are the current Claude generation (`claude-opus-5`,
+`claude-sonnet-5`, `claude-fable-5`, `claude-haiku-4-5-20251001`) — **re-check
+these against Anthropic's docs when you next touch this**, since model names
+move faster than this file does.
 
-### C4 · Grok (xAI) and DeepSeek providers — P2, S (needs C1)
-Both are OpenAI-compatible (`https://api.x.ai/v1`,
-`https://api.deepseek.com`). Add presets, default models, env fallbacks
-(`SOSOPO_AI_GROK_*`, `SOSOPO_AI_DEEPSEEK_*`), docs.
-**Accept:** provider appears in both scopes with save/refresh/remove tests.
+### C3 · Google Gemini provider — **done**
+Registered against the OpenAI-compatible endpoint
+(`https://generativelanguage.googleapis.com/v1beta/openai`), so it reuses
+`ChatAdapter` unchanged: one registry line, no adapter.
+
+**Unverified:** model listing through the compatible endpoint is covered only
+by mocked HTTP. If a live refresh returns something unexpected, that is the
+place to look, and the fix belongs in a Gemini adapter subclass.
+
+### C4 · Grok (xAI) and DeepSeek providers — **done**
+`https://api.x.ai/v1` and `https://api.deepseek.com`, both OpenAI-compatible,
+both one registry line. Env fallbacks `SOSOPO_AI_GROK_*` and
+`SOSOPO_AI_DEEPSEEK_*`.
+
+All four appear in the provider dropdown, work at instance and workspace
+scope, and never return a key to the browser. That C2 needed an adapter while
+C3/C4 needed one line each is the C1 seam doing its job.
 
 ## D. AI marketing capabilities
 
@@ -415,8 +424,7 @@ no secret fields accepted even if present in the file.
 
 ## Suggested order
 
-1. ~~**A1**~~ and ~~**C1**~~ are done. C2/C3/C4 can now run in parallel; A1b
-   alongside them.
+1. ~~**A1, A1b, A2, A3, A4**~~ and ~~**C1-C4**~~ are done.
 2. ~~**B1 → B2 → B3 → B4**~~ done: the credit system arc is complete.
 3. D1 → D2 → D3 build directly on the credit + provider work.
 4. E-tasks are independent of A–D and safe for parallel agents.

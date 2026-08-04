@@ -90,3 +90,53 @@ class OpenRouterAdapter(ChatAdapter):
     """OpenRouter publishes its complete catalog without authentication."""
 
     catalog_needs_key = False
+
+
+class ClaudeAdapter(ChatAdapter):
+    """Anthropic's native Messages API, which differs from the OpenAI shape.
+
+    Three differences matter, and this adapter exists for them:
+
+    - Authentication is ``x-api-key`` plus a pinned ``anthropic-version``.
+      Never a bearer token.
+    - The system prompt is a top-level ``system`` field, not a message with
+      ``role: system``.
+    - ``max_tokens`` is required, and a reply is a list of content blocks
+      rather than a single message string.
+    """
+
+    ANTHROPIC_VERSION = "2023-06-01"
+
+    @classmethod
+    def _headers(cls, settings: dict[str, str]) -> dict[str, str]:
+        return {"x-api-key": settings["api_key"], "anthropic-version": cls.ANTHROPIC_VERSION}
+
+    @classmethod
+    def build_chat_request(cls, settings: dict[str, str], messages: list[dict[str, str]], options: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, str]]:
+        system = "\n".join(str(message.get("content", "")) for message in messages if message.get("role") == "system")
+        conversation = [message for message in messages if message.get("role") != "system"]
+        payload: dict[str, Any] = {
+            "model": options["model"],
+            "max_tokens": options["max_tokens"],
+            "messages": conversation,
+            "temperature": options["temperature"],
+        }
+        if system:
+            payload["system"] = system
+        return f"{settings['base_url']}/v1/messages", payload, cls._headers(settings)
+
+    @classmethod
+    def parse_chat_response(cls, result: dict[str, Any]) -> str:
+        blocks = result.get("content")
+        text = "\n".join(
+            str(block.get("text", ""))
+            for block in (blocks if isinstance(blocks, list) else [])
+            if isinstance(block, dict) and block.get("type") == "text"
+        ).strip()
+        if not text:
+            raise ProviderError("The AI provider did not return post copy.")
+        return text
+
+    @classmethod
+    def build_model_list_request(cls, settings: dict[str, str]) -> tuple[str, dict[str, str] | None]:
+        return f"{settings['base_url']}/v1/models", cls._headers(settings)

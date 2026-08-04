@@ -7,7 +7,7 @@ from typing import NamedTuple
 
 try:  # package import (tests, `python -m app.server`)
     from . import http_client
-    from .ai_adapters import ChatAdapter, MiniMaxAdapter, OpenRouterAdapter
+    from .ai_adapters import ChatAdapter, ClaudeAdapter, MiniMaxAdapter, OpenRouterAdapter
     from .config import config, now
     from .database import db
     from .errors import ProviderError
@@ -15,7 +15,7 @@ try:  # package import (tests, `python -m app.server`)
     from .workspaces import save_workspace_setting
 except ImportError:  # script import (`python /app/app/server.py`)
     import http_client
-    from ai_adapters import ChatAdapter, MiniMaxAdapter, OpenRouterAdapter
+    from ai_adapters import ChatAdapter, ClaudeAdapter, MiniMaxAdapter, OpenRouterAdapter
     from config import config, now
     from database import db
     from errors import ProviderError
@@ -42,6 +42,12 @@ AI_PROVIDERS = {
     "Kimi": AiProvider("kimi", "SOSOPO_AI_KIMI", "https://api.moonshot.ai/v1"),
     "MiniMax": AiProvider("minimax", "SOSOPO_AI_MINIMAX", "https://api.minimax.io/v1", MiniMaxAdapter),
     "Z.AI GLM": AiProvider("zai", "SOSOPO_AI_ZAI", "https://api.z.ai/api/paas/v4"),
+    "Claude": AiProvider("claude", "SOSOPO_AI_CLAUDE", "https://api.anthropic.com", ClaudeAdapter),
+    # Gemini, Grok, and DeepSeek all serve an OpenAI-compatible surface, so the
+    # default adapter covers them and each costs exactly one line here.
+    "Gemini": AiProvider("gemini", "SOSOPO_AI_GEMINI", "https://generativelanguage.googleapis.com/v1beta/openai"),
+    "Grok": AiProvider("grok", "SOSOPO_AI_GROK", "https://api.x.ai/v1"),
+    "DeepSeek": AiProvider("deepseek", "SOSOPO_AI_DEEPSEEK", "https://api.deepseek.com"),
 }
 
 
@@ -53,6 +59,10 @@ AI_PROVIDER_MODELS = {
     "Kimi": ["kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6"],
     "MiniMax": ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed", "M2-her"],
     "Z.AI GLM": ["glm-5.2", "glm-5.1", "glm-5"],
+    "Claude": ["claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-haiku-4-5-20251001"],
+    "Gemini": ["gemini-3-pro", "gemini-3-flash", "gemini-2.5-pro"],
+    "Grok": ["grok-4.1", "grok-4", "grok-3"],
+    "DeepSeek": ["deepseek-chat", "deepseek-reasoner"],
 }
 
 
