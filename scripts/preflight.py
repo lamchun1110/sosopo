@@ -12,7 +12,9 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.server import DATA_DIR, DATABASE_URL, Fernet, config, public_url  # noqa: E402
+from cryptography.fernet import Fernet  # noqa: E402
+
+from app.server import DATA_DIR, DATABASE_URL, config, public_url  # noqa: E402
 
 
 def checks(production: bool) -> tuple[list[str], list[str]]:

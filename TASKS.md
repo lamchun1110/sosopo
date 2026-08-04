@@ -1,0 +1,357 @@
+# Sosopo task board
+
+Open tasks toward the CLAUDE.md vision: an AI-first, open-source social media
+management platform that evolves into an AI agent platform for marketing.
+Each task is written to be handed to an agent with no other context than this
+file plus the repository. Read **Current state** and **Working agreements**
+before starting any task. Work on one task per session/branch; respect the
+listed dependencies.
+
+## Current state (do not redo)
+
+All six phases of ROADMAP.md are complete and deployed:
+
+- Workspaces with `owner`/`admin`/`editor`/`viewer` roles, memberships, and
+  server-side tenant isolation on every query (Phase 1).
+- Hashed email invitations, `/invite` acceptance, SMTP with link fallback,
+  self-service signup gating, `self_hosted`/`hosted` deployment modes (Phase 2).
+- Connection health states, automatic X/LinkedIn/Threads token refresh,
+  secret-free workspace export, owner-only workspace deletion (Phase 3).
+- Plan limits (free/starter/pro; self-hosted unlimited), monthly usage
+  metering (`usage_records`), owner AI budget caps, Stripe Checkout plus a
+  signature-verified webhook, workspace-level AI provider keys with instance
+  fallback (Phase 4).
+- Async AI media jobs (image + OpenAI-style video) with progress, mandatory
+  admin moderation, approved library, composer attach, credit refund on
+  failure (Phase 5).
+- `GET /api/workspaces/status` dashboard data, audited metadata-only
+  `GET /api/admin/workspaces`, media/workspace Prometheus gauges (Phase 6).
+
+Suite: 93 tests, all passing.
+
+`app/` is split into focused modules (A1). Dependency order, which is also the
+reload order in `app/server.py`: `errors` → `config` → `database` → `security`
+→ `http_client` → `audit` → `workspaces` → `plans` → `billing` →
+`invitations` → `media_storage` → `ai_providers` → `media_jobs` → `oauth` →
+`connections` → `schema` → `publishing`. `app/server.py` holds the HTTP
+`Handler`, the entrypoint, and a hand-written re-export block that keeps
+`app.server` the one public namespace for tests, `app/worker.py`, `scripts/`,
+and the container healthcheck.
+
+Two conventions exist because the test suite calls
+`importlib.reload(app.server)` after changing the environment:
+
+- Every module supports both entry modes with
+  `try: from . import x / except ImportError: import x`, because Docker runs
+  `python /app/app/server.py` (script) while tests import `app.server`
+  (package).
+- `app/server.py` reloads every sibling in dependency order, and the handful of
+  names tests replace by assignment (`request_json`, `request_form`,
+  `request_get_json`, `request_get_bytes`, `request_delete`,
+  `telegram_request`, `publish`, `PyJWKClient`, `VIDEO_POLL_SECONDS`) are
+  **absent** from `app/server.py`'s own namespace. `_SEAMS` plus the `_Facade`
+  module type forward reads and writes to the module that defines them, so a
+  test replacement is visible to every caller. Add a new patchable seam to
+  `_SEAMS`, never to the re-export block.
+
+Other key files: `app/index.html` (single-page portal), `tests/` (six files;
+`test_workspaces.py` exports the `WorkspaceHttpCase` live-HTTP harness),
+`docs/index.html` (separate docs site), `scripts/`
+(backup/restore/preflight).
+
+## Working agreements
+
+Verification for every task (from CONTRIBUTING.md):
+
+```sh
+uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python -r requirements.txt
+.venv/bin/python -m unittest discover -s tests -v
+docker compose config --quiet
+docker compose up -d --build
+curl -fsS http://127.0.0.1:8088/api/health
+```
+
+Hard rules:
+
+1. **Tenant isolation is server-side, always.** Every new query touching
+   posts, connections, media, settings, or usage must filter by the session's
+   active workspace via `Handler._require_workspace(session, role)`.
+2. **Secrets never reach browsers.** Provider/AI credentials are encrypted
+   with Fernet (`encrypt_secrets`/`decrypt_secrets`) and are never returned by
+   any API, export, or log.
+3. **Migrations are additive and idempotent** across SQLite, PostgreSQL,
+   MariaDB, and MySQL: `CREATE TABLE IF NOT EXISTS` + `add_table_column()` in
+   `setup_database()`, following the existing `%s`-id-column pattern. Never
+   rewrite or drop existing columns.
+4. **Self-hosted behavior must not regress.** New limits, billing, or hosted
+   features default off (or unlimited) when `SOSOPO_DEPLOYMENT_MODE` is
+   `self_hosted`.
+5. **Tests first, HTTP-level where possible.** Subclass `WorkspaceHttpCase`
+   for endpoint tests; mock outbound HTTP by monkeypatching
+   `request_json`/`request_form`/`request_get_json` as existing tests do.
+6. Conventional commits (`feat:`/`fix:`/`refactor:`/`docs:`), no attribution
+   trailers. Update README.md, ROADMAP.md, and docs/index.html when
+   user-facing behavior changes.
+7. Evaluate every design against CLAUDE.md's decision framework: simpler?
+   generalizable? extensible? works for OSS and hosted? scales to large
+   organizations?
+
+Priorities: **P0** unblocks other work · **P1** core vision · **P2** valuable
+· **P3** research/design first. Effort: S (≤half day), M (a day-ish), L
+(multi-day).
+
+---
+
+## A. Architecture and technical debt
+
+### A1 · Modularize `app/server.py` — **done**
+Split into 17 modules of 12–329 lines plus `app/server.py`. See
+**Current state** for the layout and the two conventions it introduced.
+93/93 tests green with no test edits; all three containers healthy.
+
+### A1b · Split the `Handler` route chain — P1, M
+A1 left `app/server.py` at ~1,550 lines: ~215 lines of imports and re-exports
+plus the `Handler` itself, whose `do_GET` (~420 lines) and `do_POST` (~690
+lines) are single `if`-chains. This is the one file still over the 800-line
+target. Introduce an explicit route table or per-family mixins
+(`auth`, `posts`, `connections`, `media`, `team`, `ai`, `billing`) so each
+route family lives in its own module, keeping `Handler` as dispatch plus the
+shared `_json`/`_session`/`_require_workspace` helpers.
+**Constraints:** the `if`-chain's fallthrough-to-404 ordering is behavior —
+preserve it, including which check runs first for overlapping prefixes. Same
+dual-entry and reload rules as A1.
+**Accept:** 93/93 tests green with no test edits; every module ≤800 lines;
+no behavior change.
+
+### A2 · Safe multi-worker job claiming — P2, M
+`worker.py`'s docstring says scaling needs row-level locking. Posts already
+use an atomic `UPDATE … WHERE state='scheduled'` claim, which is safe for one
+worker per row race but relies on autocommit timing per backend.
+On PostgreSQL use `SELECT … FOR UPDATE SKIP LOCKED` for post and media-job
+claims (`claim_post`, `claim_media_job`); keep current behavior for SQLite.
+Document "scale workers only on PostgreSQL" in README.
+**Accept:** regression tests for double-claim under both paths; existing
+lease-recovery tests still pass.
+
+### A3 · Extract portal JavaScript — P2, M
+`app/index.html` mixes markup and a large inline script. Move the script to
+`app/portal.js` served statically (CSP already allows `'self'`), split into
+logical sections (auth, composer, media, team, ai) with no framework and no
+build step. Keep behavior identical.
+**Accept:** manual smoke of sign-in/composer/media/team views; no console
+errors; CSP header unchanged except dropping `'unsafe-inline'` for scripts if
+feasible.
+
+### A4 · OpenAPI description of the HTTP API — P2, M
+CLAUDE.md demands API-first design. Hand-write `docs/openapi.yaml` covering
+every `/api/*` route (auth model: session cookie + `X-CSRF-Token`), serve it
+from the docs site, and add a test that every route string present in
+`Handler` appears in the spec (regex-scan `server.py` for `"/api/…"` literals).
+**Accept:** spec validates (`python -c` with a YAML load is enough — no new
+runtime deps), coverage test green, docs site links it.
+
+## B. Organizations and the credit system
+
+### B1 · Organization layer above workspaces — P1, L
+CLAUDE.md's hierarchy is Organization → Team → User; today's workspaces are
+the "team" level. Add `organizations` (name, slug, owner, status, timestamps)
+and `organization_memberships` (user, org, role: `owner`/`admin`/`member`),
+plus nullable `workspaces.organization_id`. Personal workspaces stay
+org-less. Org admins can create workspaces inside the org and see an org
+workspace list; workspace-level roles keep governing content access.
+Migration: purely additive; nothing changes for existing installs until an
+org is created. UI: minimal — an "Organization" block in the Team tab.
+**Accept:** HTTP tests for org creation, org-scoped workspace listing, and
+isolation (non-members see nothing); migration idempotent on all 4 backends
+(pattern-level: SQLite tests + statement review).
+
+### B2 · Auditable AI credit ledger — P1, L
+CLAUDE.md: credits are consumed **only** by AI usage (text + media); posts,
+scheduling, storage, seats never consume credits; transactions must be
+auditable. Add `credit_accounts` (owner_type: organization/workspace/user,
+owner_id, balance) and `credit_transactions` (account, delta, reason,
+actor_user_id, related metric/job id, created_at; append-only). Debit one
+credit per AI text generation and per media job (reuse the existing
+charge/refund points in `/api/ai/generate` and media jobs — keep the
+refund-on-failure behavior). In hosted mode, map plan quotas to a monthly
+credit grant (top up on period rollover); self-hosted defaults to an
+unlimited account (no debits recorded as failures, ledger optional via
+`SOSOPO_CREDITS_ENFORCED`). Keep `usage_records` for analytics.
+**Accept:** balance never goes negative under enforcement; every debit/credit
+has a transaction row; existing quota tests updated coherently; self-hosted
+default behavior unchanged.
+
+### B3 · Hierarchical credit allocation — P1, M (needs B1 + B2)
+Org can allocate credits to workspaces or directly to users; a workspace can
+allocate to users. Unused credits remain with the owner unless explicitly
+transferred; transfers are transactions (paired debit/credit rows) and
+auditable via the audit log. Endpoints: `POST /api/organizations/credits/
+allocate`, workspace equivalent, plus balance listing. Resolution order when
+debiting a user's AI action: user account → workspace account → org account.
+**Accept:** HTTP tests for allocation permission rules, resolution order, and
+audit trail; no cross-org leakage.
+
+### B4 · Stripe credit top-ups — P2, M (needs B2)
+One-time Checkout purchases (`mode=payment`) crediting an org or workspace
+account via the existing verified webhook (`apply_billing_event`). Keep the
+subscription plans working unchanged. Env: `STRIPE_PRICE_CREDITS_*` pack
+price IDs.
+**Accept:** webhook test with signed `checkout.session.completed` carrying a
+credits pack; ledger row created exactly once (idempotency by Stripe event id).
+
+## C. AI provider expansion
+
+### C1 · Provider adapter seam — P0, M
+Text generation assumes OpenAI-compatible `chat/completions` (with a MiniMax
+special case); Claude and Gemini need different shapes. Introduce a small
+adapter layer keyed by provider slug: `build_chat_request(settings, messages,
+options) -> (url, payload, headers)` and `parse_chat_response(result) -> str`,
+plus equivalents for model listing. Default adapter = current OpenAI shape;
+MiniMax's endpoint override moves into its adapter. No behavior change.
+**Accept:** existing AI tests pass; adapters unit-tested; `AI_PROVIDERS`
+gains per-provider adapter references without hardcoding in call sites.
+
+### C2 · Anthropic Claude provider — P1, M (needs C1)
+Native Messages API: `POST {base}/v1/messages` with `x-api-key` +
+`anthropic-version` headers, `max_tokens` required, content blocks in the
+response; model list from `GET /v1/models`. Preset models: current Claude
+generation (e.g. `claude-sonnet-4-5`, check the docs current at
+implementation time). Works at both instance and workspace scope; key
+encrypted like all others.
+**Accept:** mocked-HTTP tests for request shape, auth header (never Bearer),
+response parsing, and model refresh; README/docs updated.
+
+### C3 · Google Gemini provider — P1, S/M (needs C1)
+Use Gemini's OpenAI-compatible endpoint (`…/v1beta/openai/`) to reuse the
+default adapter; only base URL, key handling, and model presets differ.
+Verify model listing works through the compatible endpoint, otherwise adapt.
+**Accept:** same test coverage as C2.
+
+### C4 · Grok (xAI) and DeepSeek providers — P2, S (needs C1)
+Both are OpenAI-compatible (`https://api.x.ai/v1`,
+`https://api.deepseek.com`). Add presets, default models, env fallbacks
+(`SOSOPO_AI_GROK_*`, `SOSOPO_AI_DEEPSEEK_*`), docs.
+**Accept:** provider appears in both scopes with save/refresh/remove tests.
+
+## D. AI marketing capabilities
+
+### D1 · Brand voice profiles — P1, M
+Per-workspace brand profile (tone, audience, do/don't phrases, sample posts,
+default hashtags; ≤4 KB) stored in `workspace_settings` as plain JSON, edited
+by workspace admins in the AI tab, and injected as system-prompt context into
+`generate_post_copy` and media `media_job_prompt` (style hint). A composer
+toggle ("Apply brand voice", default on when a profile exists).
+**Accept:** HTTP tests: only admins edit; prompt injection verified via
+captured mock payloads; generation without a profile unchanged.
+
+### D2 · AI content calendar generation — P1, L (better after D1)
+"Plan my week": editor supplies a brief, cadence, and target channels; the AI
+returns N post drafts with proposed local schedule times; Sosopo creates them
+as **drafts** (state `draft`, never auto-scheduled or published) tagged in a
+new `campaigns` table (id, workspace, name, brief, created_by) with
+`posts.campaign_id` nullable column. UI: a "Plan with AI" panel that lists the
+generated drafts for review; scheduling stays the existing manual flow.
+Charge one AI credit per generated draft.
+**Accept:** drafts land unscheduled and workspace-scoped; malformed AI output
+degrades to an error, never partial junk (parse strictly, insert
+transactionally); quota/credit tests.
+
+### D3 · AI analytics summarization — P2, M
+`POST /api/workspaces/summary` (admin+): feed `GET /api/workspaces/status`
+data plus the last 30 days of deliveries into the configured text provider
+and return a plain-language summary with observations and suggestions.
+Read-only, one AI credit, output clearly labeled as AI-generated in the
+overview panel.
+**Accept:** mocked-provider test asserting the prompt contains real metrics
+and no secrets; viewer/editor get 403.
+
+### D4 · Campaign agent design (RFC) — P3, M (needs D1, D2)
+Design doc (`docs/rfcs/0001-campaign-agent.md`) for a multi-step agent:
+brief → strategy → calendar → drafts → (later) performance feedback loop.
+Cover: step orchestration on the existing job-queue pattern, human approval
+gates (reuse moderation model), credit accounting per step, failure recovery,
+and multi-agent collaboration boundaries. No implementation.
+**Accept:** RFC reviewed against the CLAUDE.md decision framework, with an
+incremental delivery plan whose first slice is shippable in ≤1 week.
+
+### D5 · Auto-reply research (RFC) — P3, S
+Inbound comment/mention APIs differ wildly per platform and most need extra
+review/permissions. Produce `docs/rfcs/0002-auto-reply.md`: per-provider
+feasibility (Meta, X, Telegram, Discord), webhook vs polling, safety rails
+(never reply without a workspace-approved template/policy), and moderation.
+**Accept:** RFC only; explicit go/no-go recommendation per platform.
+
+## E. Publishing depth (Postiz parity)
+
+### E1 · LinkedIn image publishing — P1, M
+LinkedIn is text-only today (`publish()` rejects images). Implement the
+member-image flow: register upload (`POST /rest/images?action=initializeUpload`),
+PUT the bytes, attach the image URN to the post payload. Respect
+`CHANNEL_MEDIA_LIMITS` (raise LinkedIn from 0 to its real limit) and update
+validation, README, and docs.
+**Accept:** mocked-HTTP test covering initialize/upload/post sequence and
+error paths; text-only posts unchanged.
+
+### E2 · Publish approved library videos — P2, L
+Media studio produces videos, but posts only attach images. Start narrow:
+allow one approved library video per post for Telegram (`sendVideo`) and
+Discord (webhook attachment/URL embed). Extend `post_media` usage, composer
+picker, and per-channel validation (`CHANNEL_MEDIA_LIMITS` split into
+image/video rules). Meta reels/X video are follow-ups — note them in
+ROADMAP, do not attempt in this task.
+**Accept:** validation rejects videos on unsupported channels with clear
+messages; delivery tests with mocked providers; moderation gate still applies.
+
+### E3 · Alt text end-to-end — P2, S/M
+`post_media.alt_text` exists but is unused. Add alt-text inputs per attached
+image in the composer, store it, and send it where providers support it
+(X `media/metadata`, Facebook `alt_text_custom`, LinkedIn image alt). Include
+alt text in workspace export.
+**Accept:** persisted + delivered in mocked provider payloads; export test.
+
+### E4 · Post-performance ingestion — P2, L
+Pull basic metrics for published posts where the connected credential allows
+(X public metrics, Facebook page post insights, Telegram views via Bot API
+where available). New `post_metrics` table (post_target, metric, value,
+fetched_at); worker refreshes on a slow cadence (≥1h) with per-provider
+backoff; surface per-post metrics in delivery history and aggregate into
+`GET /api/workspaces/status` (feeds D3).
+**Accept:** mocked fetch tests, graceful skip when a provider/credential
+cannot report metrics, no rate-limit hammering (cadence test).
+
+## F. Platform and operations
+
+### F1 · Plugin architecture RFC — P3, M
+CLAUDE.md requires a plugin-friendly architecture. After A1 lands, write
+`docs/rfcs/0003-plugins.md`: registration points for channel providers and AI
+providers (the C1 adapter seam is the prototype), packaging (pip entry
+points vs drop-in modules), sandboxing/trust model for self-hosted installs,
+and what stays core vs plugin.
+**Accept:** RFC with a migration path for the two existing registries.
+
+### F2 · Browser end-to-end test — P2, M
+One Playwright (or equivalent) test in `tests/e2e/` covering: setup → create
+post → invite flow page renders → switch workspace → media tab renders.
+Runs against `docker compose up` locally and in CI as an optional job; keep
+the unittest suite dependency-free.
+**Accept:** e2e job green locally; README dev section documents how to run it.
+
+### F3 · Workspace import (restore) — P2, M
+The export exists; imports don't. `POST /api/workspaces/import` (owner of a
+fresh, empty workspace) accepting the export JSON: recreates posts (as drafts,
+media URLs preserved when reachable), members are **not** imported (invite
+separately), connections are recreated disabled and secretless, requiring
+rotation. Strict schema validation; size cap.
+**Accept:** round-trip test export→import; injected/malformed JSON rejected;
+no secret fields accepted even if present in the file.
+
+---
+
+## Suggested order
+
+1. ~~**A1**~~ (done) → **C1** → C2/C3/C4 in parallel. A1b can run alongside.
+2. **B1 → B2 → B3** as one arc (the credit system is the heart of the
+   CLAUDE.md business model); B4 after.
+3. D1 → D2 → D3 build directly on the credit + provider work.
+4. E-tasks are independent of A–D and safe for parallel agents.
+5. RFCs (D4, D5, F1) can run any time; implementation waits for review.
