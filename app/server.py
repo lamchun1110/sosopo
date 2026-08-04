@@ -36,7 +36,8 @@ from zoneinfo import ZoneInfo
 # it depends on have themselves been reloaded.
 _SUBMODULES = (
     "errors", "config", "database", "security", "http_client", "audit", "workspaces", "plans", "billing",
-    "invitations", "media_storage", "ai_providers", "media_jobs", "oauth", "connections", "schema", "publishing",
+    "invitations", "media_storage", "ai_adapters", "ai_providers", "media_jobs", "oauth", "connections", "schema",
+    "publishing",
 )
 _PACKAGE = __name__.rpartition(".")[0]
 
@@ -182,6 +183,7 @@ media_exists = _MODULES["media_storage"].media_exists
 media_bytes = _MODULES["media_storage"].media_bytes
 post_media_urls = _MODULES["media_storage"].post_media_urls
 
+AiProvider = _MODULES["ai_providers"].AiProvider
 AI_PROVIDERS = _MODULES["ai_providers"].AI_PROVIDERS
 AI_PROVIDER_MODELS = _MODULES["ai_providers"].AI_PROVIDER_MODELS
 AI_PROVIDER_IMAGE_MODELS = _MODULES["ai_providers"].AI_PROVIDER_IMAGE_MODELS
@@ -612,7 +614,7 @@ class Handler(SimpleHTTPRequestHandler):
             if session["role"] != "admin":
                 self._json({"error": "Administrator access required."}, HTTPStatus.FORBIDDEN); return
             providers = []
-            for name, (slug, _, default_base) in AI_PROVIDERS.items():
+            for name in AI_PROVIDERS:
                 stored = stored_ai_provider_settings(name)
                 catalog = ai_model_catalog(stored)
                 providers.append({"name": name, "model": stored.get("model", AI_PROVIDER_MODELS[name][0]), "models": catalog or AI_PROVIDER_MODELS[name], "models_count": len(catalog), "models_checked_at": stored.get("models_checked_at"), "has_api_key": bool(stored.get("api_key"))})
@@ -966,7 +968,7 @@ class Handler(SimpleHTTPRequestHandler):
                 # unavailable, and the selected default may be newly released.
                 if model not in catalog:
                     catalog = [model, *catalog]
-                stored = {"api_key": api_key or current["api_key"], "base_url": definition[2], "model": model, "models": json.dumps(catalog)}
+                stored = {"api_key": api_key or current["api_key"], "base_url": definition.base_url, "model": model, "models": json.dumps(catalog)}
                 if current.get("models_checked_at"):
                     stored["models_checked_at"] = current["models_checked_at"]
                 save_ai_provider_settings(provider, stored)
@@ -1173,7 +1175,7 @@ class Handler(SimpleHTTPRequestHandler):
                 catalog = ai_model_catalog(current) or AI_PROVIDER_MODELS[provider]
                 if model not in catalog:
                     catalog = [model, *catalog]
-                stored = {"api_key": api_key or current["api_key"], "base_url": AI_PROVIDERS[provider][2], "model": model, "models": json.dumps(catalog)}
+                stored = {"api_key": api_key or current["api_key"], "base_url": AI_PROVIDERS[provider].base_url, "model": model, "models": json.dumps(catalog)}
                 if current.get("models_checked_at"):
                     stored["models_checked_at"] = current["models_checked_at"]
                 save_ai_provider_settings(provider, stored, workspace_id)

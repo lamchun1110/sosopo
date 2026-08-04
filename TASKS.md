@@ -27,14 +27,15 @@ All six phases of ROADMAP.md are complete and deployed:
 - `GET /api/workspaces/status` dashboard data, audited metadata-only
   `GET /api/admin/workspaces`, media/workspace Prometheus gauges (Phase 6).
 
-Suite: 93 tests, all passing.
+Suite: 106 tests, all passing.
 
 `app/` is split into focused modules (A1). Dependency order, which is also the
 reload order in `app/server.py`: `errors` → `config` → `database` → `security`
 → `http_client` → `audit` → `workspaces` → `plans` → `billing` →
-`invitations` → `media_storage` → `ai_providers` → `media_jobs` → `oauth` →
-`connections` → `schema` → `publishing`. `app/server.py` holds the HTTP
-`Handler`, the entrypoint, and a hand-written re-export block that keeps
+`invitations` → `media_storage` → `ai_adapters` → `ai_providers` →
+`media_jobs` → `oauth` → `connections` → `schema` → `publishing`.
+`app/server.py` holds the HTTP `Handler`, the entrypoint, and a
+hand-written re-export block that keeps
 `app.server` the one public namespace for tests, `app/worker.py`, `scripts/`,
 and the container healthcheck.
 
@@ -54,7 +55,7 @@ Two conventions exist because the test suite calls
   test replacement is visible to every caller. Add a new patchable seam to
   `_SEAMS`, never to the re-export block.
 
-Other key files: `app/index.html` (single-page portal), `tests/` (six files;
+Other key files: `app/index.html` (single-page portal), `tests/` (seven files;
 `test_workspaces.py` exports the `WorkspaceHttpCase` live-HTTP harness),
 `docs/index.html` (separate docs site), `scripts/`
 (backup/restore/preflight).
@@ -120,8 +121,8 @@ shared `_json`/`_session`/`_require_workspace` helpers.
 **Constraints:** the `if`-chain's fallthrough-to-404 ordering is behavior —
 preserve it, including which check runs first for overlapping prefixes. Same
 dual-entry and reload rules as A1.
-**Accept:** 93/93 tests green with no test edits; every module ≤800 lines;
-no behavior change.
+**Accept:** full suite green with no edits to existing tests; every module
+≤800 lines; no behavior change.
 
 ### A2 · Safe multi-worker job claiming — P2, M
 `worker.py`'s docstring says scaling needs row-level locking. Posts already
@@ -201,15 +202,17 @@ credits pack; ledger row created exactly once (idempotency by Stripe event id).
 
 ## C. AI provider expansion
 
-### C1 · Provider adapter seam — P0, M
-Text generation assumes OpenAI-compatible `chat/completions` (with a MiniMax
-special case); Claude and Gemini need different shapes. Introduce a small
-adapter layer keyed by provider slug: `build_chat_request(settings, messages,
-options) -> (url, payload, headers)` and `parse_chat_response(result) -> str`,
-plus equivalents for model listing. Default adapter = current OpenAI shape;
-MiniMax's endpoint override moves into its adapter. No behavior change.
-**Accept:** existing AI tests pass; adapters unit-tested; `AI_PROVIDERS`
-gains per-provider adapter references without hardcoding in call sites.
+### C1 · Provider adapter seam — **done**
+`app/ai_adapters.py` holds `ChatAdapter` (the OpenAI-compatible default),
+`MiniMaxAdapter` (own chat path, no cache-busted catalog URI), and
+`OpenRouterAdapter` (`catalog_needs_key = False`). Adapters are pure — they
+build requests and parse responses without I/O — so every wire format is
+directly unit-testable (`tests/test_ai_adapters.py`).
+
+`AI_PROVIDERS` values are now `AiProvider(slug, environment_prefix, base_url,
+adapter)` named tuples; `adapter` defaults to `ChatAdapter`, so **a provider
+that speaks the OpenAI shape needs one line in the registry and nothing
+else**. No call site branches on a provider name any more.
 
 ### C2 · Anthropic Claude provider — P1, M (needs C1)
 Native Messages API: `POST {base}/v1/messages` with `x-api-key` +
@@ -349,7 +352,8 @@ no secret fields accepted even if present in the file.
 
 ## Suggested order
 
-1. ~~**A1**~~ (done) → **C1** → C2/C3/C4 in parallel. A1b can run alongside.
+1. ~~**A1**~~ and ~~**C1**~~ are done. C2/C3/C4 can now run in parallel; A1b
+   alongside them.
 2. **B1 → B2 → B3** as one arc (the credit system is the heart of the
    CLAUDE.md business model); B4 after.
 3. D1 → D2 → D3 build directly on the credit + provider work.

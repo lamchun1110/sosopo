@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-import time
+from typing import NamedTuple
 
 try:  # package import (tests, `python -m app.server`)
     from . import http_client
+    from .ai_adapters import ChatAdapter, MiniMaxAdapter, OpenRouterAdapter
     from .config import config, now
     from .database import db
     from .errors import ProviderError
@@ -14,6 +15,7 @@ try:  # package import (tests, `python -m app.server`)
     from .workspaces import save_workspace_setting
 except ImportError:  # script import (`python /app/app/server.py`)
     import http_client
+    from ai_adapters import ChatAdapter, MiniMaxAdapter, OpenRouterAdapter
     from config import config, now
     from database import db
     from errors import ProviderError
@@ -21,12 +23,25 @@ except ImportError:  # script import (`python /app/app/server.py`)
     from workspaces import save_workspace_setting
 
 
+class AiProvider(NamedTuple):
+    """One text-generation provider: where it lives and how it is spoken to.
+
+    ``adapter`` defaults to the OpenAI-compatible shape, so adding a provider
+    that speaks it needs one line here and nothing else.
+    """
+
+    slug: str
+    environment_prefix: str
+    base_url: str
+    adapter: type[ChatAdapter] = ChatAdapter
+
+
 AI_PROVIDERS = {
-    "OpenAI": ("openai", "SOSOPO_AI_OPENAI", "https://api.openai.com/v1"),
-    "OpenRouter": ("openrouter", "SOSOPO_AI_OPENROUTER", "https://openrouter.ai/api/v1"),
-    "Kimi": ("kimi", "SOSOPO_AI_KIMI", "https://api.moonshot.ai/v1"),
-    "MiniMax": ("minimax", "SOSOPO_AI_MINIMAX", "https://api.minimax.io/v1"),
-    "Z.AI GLM": ("zai", "SOSOPO_AI_ZAI", "https://api.z.ai/api/paas/v4"),
+    "OpenAI": AiProvider("openai", "SOSOPO_AI_OPENAI", "https://api.openai.com/v1"),
+    "OpenRouter": AiProvider("openrouter", "SOSOPO_AI_OPENROUTER", "https://openrouter.ai/api/v1", OpenRouterAdapter),
+    "Kimi": AiProvider("kimi", "SOSOPO_AI_KIMI", "https://api.moonshot.ai/v1"),
+    "MiniMax": AiProvider("minimax", "SOSOPO_AI_MINIMAX", "https://api.minimax.io/v1", MiniMaxAdapter),
+    "Z.AI GLM": AiProvider("zai", "SOSOPO_AI_ZAI", "https://api.z.ai/api/paas/v4"),
 }
 
 
@@ -59,7 +74,7 @@ def stored_ai_provider_settings(provider: str, workspace_id: int | None = None) 
     definition = AI_PROVIDERS.get(provider)
     if definition is None:
         raise ProviderError("Choose a supported AI provider.", retryable=False)
-    setting_name = f"ai_provider_{definition[0]}"
+    setting_name = f"ai_provider_{definition.slug}"
     with db() as connection:
         if workspace_id is None:
             row = connection.execute("SELECT value FROM instance_settings WHERE name = ?", (setting_name,)).fetchone()
@@ -84,7 +99,7 @@ def effective_ai_provider_stored(provider: str, workspace_id: int | None) -> tup
 def save_ai_provider_settings(provider: str, settings: dict, workspace_id: int | None = None) -> None:
     """Save a provider configuration and its locally cached, reviewed model catalog."""
     definition = AI_PROVIDERS[provider]
-    setting_name = f"ai_provider_{definition[0]}"
+    setting_name = f"ai_provider_{definition.slug}"
     with db() as connection:
         if workspace_id is None:
             exists = connection.execute("SELECT 1 FROM instance_settings WHERE name = ?", (setting_name,)).fetchone()
@@ -101,7 +116,7 @@ def remove_ai_provider_settings(provider: str, workspace_id: int | None = None) 
     definition = AI_PROVIDERS.get(provider)
     if definition is None:
         raise ProviderError("Choose a supported AI provider.", retryable=False)
-    setting_name = f"ai_provider_{definition[0]}"
+    setting_name = f"ai_provider_{definition.slug}"
     with db() as connection:
         if workspace_id is None:
             return connection.execute("DELETE FROM instance_settings WHERE name = ?", (setting_name,)).rowcount == 1
@@ -119,14 +134,14 @@ def ai_model_catalog(stored: dict) -> list[str]:
 
 
 def ai_provider_settings(provider: str, workspace_id: int | None = None) -> dict[str, str]:
-    """Return only a configured, OpenAI-compatible text-generation provider."""
+    """Return one text-generation provider only when it is fully configured."""
     definition = AI_PROVIDERS.get(provider)
     if definition is None:
         raise ProviderError("Choose a supported AI provider.", retryable=False)
-    _, prefix, default_base = definition
+    prefix = definition.environment_prefix
     stored, source = effective_ai_provider_stored(provider, workspace_id)
     api_key = stored.get("api_key") or ("" if source == "workspace" else config(f"{prefix}_API_KEY"))
-    base_url = stored.get("base_url") or config(f"{prefix}_BASE_URL") or default_base
+    base_url = stored.get("base_url") or config(f"{prefix}_BASE_URL") or definition.base_url
     model = stored.get("model") or config(f"{prefix}_MODEL") or AI_PROVIDER_MODELS[provider][0]
     if not api_key or not base_url.startswith("https://") or not model:
         raise ProviderError(f"{provider} AI is not configured by this Sosopo administrator.", retryable=False)
@@ -148,36 +163,16 @@ def available_ai_providers(workspace_id: int | None = None) -> list[dict]:
 
 def ai_provider_models(provider: str, workspace_id: int | None = None) -> list[str]:
     """Refresh one scope's model catalog using the provider's discovery endpoint."""
+    definition = AI_PROVIDERS.get(provider)
+    if definition is None:
+        raise ProviderError("Choose a supported AI provider.", retryable=False)
     stored = stored_ai_provider_settings(provider, workspace_id)
-    # OpenRouter publishes its complete catalog without authentication, so make
-    # it available in the selector before an administrator has saved a key.
-    if provider == "OpenRouter":
-        definition = AI_PROVIDERS[provider]
-        settings = {"name": provider, "api_key": stored.get("api_key") or config(f"{definition[1]}_API_KEY"), "base_url": definition[2]}
-    else:
+    if definition.adapter.catalog_needs_key:
         settings = ai_provider_settings(provider, workspace_id)
-    # MiniMax documents this exact endpoint for Token Plan keys.  In
-    # particular, do not append cache-busting query parameters: some MiniMax
-    # API gateways reject an otherwise valid signed/bearer request when the
-    # request URI differs from the documented endpoint.
-    model_list_url = f"{settings['base_url']}/models"
-    if provider != "MiniMax":
-        # A unique query string bypasses intermediary caches for providers
-        # which accept it. Sosopo itself never caches this response.
-        model_list_url = f"{model_list_url}?refresh={int(time.time())}"
-    headers = {"Authorization": f"Bearer {settings['api_key']}"} if settings.get("api_key") else None
-    result = http_client.request_get_json(model_list_url, headers)
-    entries = result.get("data") or result.get("models") or []
-    if not isinstance(entries, list):
-        raise ProviderError("The AI provider returned an invalid model list.")
-    models = []
-    for entry in entries:
-        identifier = (entry.get("id") or entry.get("model") or entry.get("name")) if isinstance(entry, dict) else entry if isinstance(entry, str) else None
-        if isinstance(identifier, str) and identifier and len(identifier) <= 200:
-            models.append(identifier)
-    if not models:
-        raise ProviderError("The AI provider did not return any selectable models.")
-    models = sorted(set(models), key=str.casefold)[:1_000]
+    else:
+        settings = {"name": provider, "api_key": stored.get("api_key") or config(f"{definition.environment_prefix}_API_KEY"), "base_url": definition.base_url}
+    model_list_url, headers = definition.adapter.build_model_list_request(settings)
+    models = definition.adapter.parse_model_list(http_client.request_get_json(model_list_url, headers))
     # Keep a known-good catalog locally. The composer uses this catalog rather than
     # contacting the provider on every page load, and rejects unknown model IDs.
     stored.update({"models": json.dumps(models), "models_checked_at": now()})
@@ -196,10 +191,6 @@ def generate_post_copy(provider: str, model: str, instruction: str, draft: str, 
         raise ProviderError("AI request is too long.", retryable=False)
     prompt = f"Write one ready-to-publish social media post. Platforms: {', '.join(channels) or 'general social media'}. Brief: {instruction.strip() or 'Improve the draft below.'}\nDraft to improve (may be empty):\n{draft.strip()}"
     messages = [{"role": "system", "content": "You are Sosopo's concise social-media copywriter. Return only the finished post copy; do not add a title, explanation, markdown fence, or quotation marks."}, {"role": "user", "content": prompt}]
-    endpoint = f"{settings['base_url']}/text/chatcompletion_v2" if provider == "MiniMax" else f"{settings['base_url']}/chat/completions"
-    result = http_client.request_json(endpoint, {"model": selected_model, "messages": messages, "temperature": 0.7, "max_tokens": 700}, {"Authorization": f"Bearer {settings['api_key']}"})
-    choices = result.get("choices", [])
-    content = choices[0].get("message", {}).get("content", "") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else ""
-    if not isinstance(content, str) or not content.strip():
-        raise ProviderError("The AI provider did not return post copy.")
-    return content.strip()
+    adapter = AI_PROVIDERS[provider].adapter
+    endpoint, payload, headers = adapter.build_chat_request(settings, messages, {"model": selected_model, "temperature": 0.7, "max_tokens": 700})
+    return adapter.parse_chat_response(http_client.request_json(endpoint, payload, headers))
