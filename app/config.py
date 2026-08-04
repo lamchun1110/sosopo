@@ -144,6 +144,13 @@ PLAN_LIMITS: dict[str, dict[str, int] | None] = {
 STRIPE_PLAN_PRICE_VARIABLES = {"starter": "STRIPE_PRICE_STARTER", "pro": "STRIPE_PRICE_PRO"}
 
 
+# One-time credit packs. Each is sold only when its Stripe price ID is set.
+# Override or extend with the SOSOPO_CREDIT_PACKS JSON environment value.
+STRIPE_CREDIT_PACKS: dict[str, dict[str, object]] = {
+    "small": {"price_variable": "STRIPE_PRICE_CREDITS_SMALL", "credits": 100},
+    "medium": {"price_variable": "STRIPE_PRICE_CREDITS_MEDIUM", "credits": 500},
+    "large": {"price_variable": "STRIPE_PRICE_CREDITS_LARGE", "credits": 2_000},
+}
 STRIPE_WEBHOOK_TOLERANCE_SECONDS = 300
 
 

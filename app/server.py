@@ -30,8 +30,8 @@ from zoneinfo import ZoneInfo
 # module rebinds the names it imported, which is only correct once the modules
 # it depends on have themselves been reloaded.
 _SUBMODULES = (
-    "errors", "config", "database", "security", "http_client", "audit", "workspaces", "plans", "billing",
-    "invitations", "organizations", "credits", "media_storage", "ai_adapters", "ai_providers", "media_jobs", "oauth",
+    "errors", "config", "database", "security", "http_client", "audit", "workspaces", "plans",
+    "invitations", "organizations", "credits", "billing", "media_storage", "ai_adapters", "ai_providers", "media_jobs", "oauth",
     "connections", "schema",
     "publishing",
     # Route families last: each mixin imports from the modules above.
@@ -161,7 +161,9 @@ enforce_connection_limit = _MODULES["plans"].enforce_connection_limit
 enforce_storage_limit = _MODULES["plans"].enforce_storage_limit
 
 billing_enabled = _MODULES["billing"].billing_enabled
-stripe_request = _MODULES["billing"].stripe_request
+credit_packs = _MODULES["billing"].credit_packs
+is_new_billing_event = _MODULES["billing"].is_new_billing_event
+apply_credit_purchase = _MODULES["billing"].apply_credit_purchase
 verify_stripe_signature = _MODULES["billing"].verify_stripe_signature
 apply_billing_event = _MODULES["billing"].apply_billing_event
 
@@ -271,6 +273,7 @@ _SEAMS = {
     "request_delete": "http_client",
     "telegram_request": "http_client",
     "publish": "publishing",
+    "stripe_request": "billing",
     "PyJWKClient": "oauth",
     "VIDEO_POLL_SECONDS": "config",
 }

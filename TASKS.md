@@ -27,7 +27,7 @@ All six phases of ROADMAP.md are complete and deployed:
 - `GET /api/workspaces/status` dashboard data, audited metadata-only
   `GET /api/admin/workspaces`, media/workspace Prometheus gauges (Phase 6).
 
-Suite: 157 tests, all passing.
+Suite: 167 tests, all passing.
 
 `app/` is split into focused modules (A1). Dependency order, which is also the
 reload order in `app/server.py`: `errors` → `config` → `database` → `security`
@@ -50,13 +50,14 @@ Two conventions exist because the test suite calls
 - `app/server.py` reloads every sibling in dependency order, and the handful of
   names tests replace by assignment (`request_json`, `request_form`,
   `request_get_json`, `request_get_bytes`, `request_delete`,
-  `telegram_request`, `publish`, `PyJWKClient`, `VIDEO_POLL_SECONDS`) are
+  `telegram_request`, `publish`, `stripe_request`, `PyJWKClient`,
+  `VIDEO_POLL_SECONDS`) are
   **absent** from `app/server.py`'s own namespace. `_SEAMS` plus the `_Facade`
   module type forward reads and writes to the module that defines them, so a
   test replacement is visible to every caller. Add a new patchable seam to
   `_SEAMS`, never to the re-export block.
 
-Other key files: `app/index.html` (single-page portal), `tests/` (ten files;
+Other key files: `app/index.html` (single-page portal), `tests/` (eleven files;
 `test_workspaces.py` exports the `WorkspaceHttpCase` live-HTTP harness),
 `docs/index.html` (separate docs site), `scripts/`
 (backup/restore/preflight).
@@ -222,13 +223,25 @@ that fund their own actions, in resolution order).
 Allocation targets are checked for ownership, so credits cannot cross into
 another organization's workspace or fund a non-member.
 
-### B4 · Stripe credit top-ups — P2, M (needs B2)
-One-time Checkout purchases (`mode=payment`) crediting an org or workspace
-account via the existing verified webhook (`apply_billing_event`). Keep the
-subscription plans working unchanged. Env: `STRIPE_PRICE_CREDITS_*` pack
-price IDs.
-**Accept:** webhook test with signed `checkout.session.completed` carrying a
-credits pack; ledger row created exactly once (idempotency by Stripe event id).
+### B4 · Stripe credit top-ups — **done**
+One-time `mode=payment` Checkout for credit packs, credited through the
+existing signature-verified webhook. `POST /api/workspaces/billing/credits`
+(workspace owner) and packs defined by `STRIPE_CREDIT_PACKS`
+(`STRIPE_PRICE_CREDITS_SMALL`/`_MEDIUM`/`_LARGE`, overridable with the
+`SOSOPO_CREDIT_PACKS` JSON value). A pack is only offered once its Stripe
+price ID is set. Subscription plans are unchanged.
+
+`billing_events` gives the webhook idempotency by Stripe event id, so a
+replayed `checkout.session.completed` credits exactly once — this protects
+subscription events too, not only top-ups. An event with no `id` cannot be
+deduplicated and is applied as-is rather than silently dropped.
+
+**Watch out:** `audit()` opens its own connection, so it must never be called
+inside an open `db()` block — that deadlocks on SQLite. `apply_billing_event`
+collects what happened and audits after the transaction closes.
+
+`stripe_request` is now a `_SEAMS` entry, so tests can intercept Checkout
+calls the same way they intercept other outbound HTTP.
 
 ## C. AI provider expansion
 
@@ -384,8 +397,7 @@ no secret fields accepted even if present in the file.
 
 1. ~~**A1**~~ and ~~**C1**~~ are done. C2/C3/C4 can now run in parallel; A1b
    alongside them.
-2. **B1 → B2 → B3** as one arc (the credit system is the heart of the
-   CLAUDE.md business model); B4 after.
+2. ~~**B1 → B2 → B3 → B4**~~ done: the credit system arc is complete.
 3. D1 → D2 → D3 build directly on the credit + provider work.
 4. E-tasks are independent of A–D and safe for parallel agents.
 5. RFCs (D4, D5, F1) can run any time; implementation waits for review.
