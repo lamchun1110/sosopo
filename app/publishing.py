@@ -233,7 +233,19 @@ def delete_published_content(post: dict[str, Any], external_id: str, account: di
 
 
 def claim_post(post_id: int) -> bool:
+    """Take exclusive ownership of one scheduled post. True when this worker won.
+
+    The conditional UPDATE is already atomic on every backend, so a second
+    worker sees rowcount 0. On PostgreSQL the row is additionally locked with
+    SKIP LOCKED first, so concurrent workers step over a contended row instead
+    of blocking on it — which is what makes running more than one worker
+    worthwhile. See README: scale workers only on PostgreSQL.
+    """
     with db() as connection:
+        if connection.kind == "postgres":
+            locked = connection.execute("SELECT id FROM posts WHERE id = ? AND state = 'scheduled' FOR UPDATE SKIP LOCKED", (post_id,)).fetchone()
+            if locked is None:
+                return False
         result = connection.execute("UPDATE posts SET state = 'publishing', publishing_started_at = ?, attempts = attempts + 1, last_error = NULL WHERE id = ? AND state = 'scheduled'", (now(), post_id))
     return result.rowcount == 1
 

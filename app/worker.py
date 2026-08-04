@@ -1,8 +1,12 @@
 """Dedicated Sosopo delivery worker.
 
-Run this separately from the web process. For production, use PostgreSQL so the
-worker can be scaled safely after the job-claiming backend is upgraded to use
-row-level locking.
+Run this separately from the web process.
+
+Run more than one replica only on PostgreSQL. Claiming is atomic on every
+backend, so a second worker never steals a claimed job, but only PostgreSQL
+uses SELECT ... FOR UPDATE SKIP LOCKED, which lets parallel workers step over
+contended rows instead of serializing on them. On SQLite, extra workers add
+lock contention without adding throughput.
 """
 
 import logging

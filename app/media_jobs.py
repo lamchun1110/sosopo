@@ -98,8 +98,16 @@ def generate_video_media(job: dict[str, Any], settings: dict[str, str]) -> str:
 
 
 def claim_media_job() -> Record | None:
+    """Take the oldest queued media job, or None when another worker has it.
+
+    On PostgreSQL the candidate row is locked with SKIP LOCKED so parallel
+    workers pick different jobs rather than contending for the same one.
+    """
     with db() as connection:
-        row = connection.execute("SELECT id FROM media_jobs WHERE status = 'queued' ORDER BY id LIMIT 1").fetchone()
+        queued = "SELECT id FROM media_jobs WHERE status = 'queued' ORDER BY id LIMIT 1"
+        if connection.kind == "postgres":
+            queued = f"{queued} FOR UPDATE SKIP LOCKED"
+        row = connection.execute(queued).fetchone()
         if row is None:
             return None
         claimed = connection.execute("UPDATE media_jobs SET status = 'running', progress = 5, updated_at = ? WHERE id = ? AND status = 'queued'", (now(), row["id"]))

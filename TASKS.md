@@ -27,7 +27,7 @@ All six phases of ROADMAP.md are complete and deployed:
 - `GET /api/workspaces/status` dashboard data, audited metadata-only
   `GET /api/admin/workspaces`, media/workspace Prometheus gauges (Phase 6).
 
-Suite: 167 tests, all passing.
+Suite: 173 tests, all passing.
 
 `app/` is split into focused modules (A1). Dependency order, which is also the
 reload order in `app/server.py`: `errors` → `config` → `database` → `security`
@@ -57,7 +57,7 @@ Two conventions exist because the test suite calls
   test replacement is visible to every caller. Add a new patchable seam to
   `_SEAMS`, never to the re-export block.
 
-Other key files: `app/index.html` (single-page portal), `tests/` (eleven files;
+Other key files: `app/index.html` (single-page portal), `tests/` (twelve files;
 `test_workspaces.py` exports the `WorkspaceHttpCase` live-HTTP harness),
 `docs/index.html` (separate docs site), `scripts/`
 (backup/restore/preflight).
@@ -128,15 +128,19 @@ sign-out, then the auth gate, then authenticated families, then 404.
 
 `app/server.py` is now 501 lines and every module is under 800.
 
-### A2 · Safe multi-worker job claiming — P2, M
-`worker.py`'s docstring says scaling needs row-level locking. Posts already
-use an atomic `UPDATE … WHERE state='scheduled'` claim, which is safe for one
-worker per row race but relies on autocommit timing per backend.
-On PostgreSQL use `SELECT … FOR UPDATE SKIP LOCKED` for post and media-job
-claims (`claim_post`, `claim_media_job`); keep current behavior for SQLite.
-Document "scale workers only on PostgreSQL" in README.
-**Accept:** regression tests for double-claim under both paths; existing
-lease-recovery tests still pass.
+### A2 · Safe multi-worker job claiming — **done**
+`claim_post` and `claim_media_job` add `SELECT … FOR UPDATE SKIP LOCKED` on
+PostgreSQL and keep the existing conditional `UPDATE` everywhere else.
+
+The distinction matters and is worth stating precisely: claiming was already
+*correct* on every backend — the conditional UPDATE is atomic, so a second
+worker sees `rowcount 0` and loses. What PostgreSQL adds is *throughput*:
+workers step over a contended row instead of serializing on it. On SQLite
+extra replicas add lock contention without adding throughput, so run one.
+Documented in README.md and `app/worker.py`.
+
+`tests/test_job_claiming.py` races four threads for the same row and asserts
+exactly one wins, for both posts and media jobs, plus lease recovery.
 
 ### A3 · Extract portal JavaScript — P2, M
 `app/index.html` mixes markup and a large inline script. Move the script to

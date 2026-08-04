@@ -42,6 +42,8 @@ docker compose ps
 
 Compose starts two services: `sosopo` serves the authenticated web/API interface and `sosopo-worker` claims and delivers scheduled posts. Keep both running. For production, use PostgreSQL; the scheduled rows and delivery attempts persist in the database so a web-process restart does not discard queued work.
 
+**Scale workers only on PostgreSQL.** Job claiming is atomic on every supported backend, so a second worker never steals a post or media job another worker already claimed. Only PostgreSQL additionally uses `SELECT … FOR UPDATE SKIP LOCKED`, which lets parallel workers step over a contended row instead of serializing on it. On SQLite, extra worker replicas add lock contention without adding throughput — run one.
+
 The worker emits a database heartbeat on every delivery poll. Compose marks it unhealthy if three polling periods elapse without a heartbeat; check both services with `docker compose ps` and inspect failures with `docker compose logs sosopo-worker`.
 
 Transient delivery failures are retried with exponential backoff (30 seconds, 60 seconds, then 120 seconds) before a post is moved to the failed-post queue after three attempts. HTTP 429 and 5xx responses are retryable; a provider `Retry-After` value is honoured up to one hour. Other provider 4xx responses are placed in the failed-post queue immediately to avoid repeatedly sending a known-invalid request. Review the delivery history, correct the issue, and use **Retry failed delivery** to reset the counter and queue it again.
