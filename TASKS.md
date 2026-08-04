@@ -27,7 +27,7 @@ All six phases of ROADMAP.md are complete and deployed:
 - `GET /api/workspaces/status` dashboard data, audited metadata-only
   `GET /api/admin/workspaces`, media/workspace Prometheus gauges (Phase 6).
 
-Suite: 225 tests, all passing (1 skipped without PyYAML).
+Suite: 238 tests, all passing (1 skipped without PyYAML).
 
 `app/` is split into focused modules (A1). Dependency order, which is also the
 reload order in `app/server.py`: `errors` → `config` → `database` → `security`
@@ -56,8 +56,12 @@ Two conventions exist because the test suite calls
   module type forward reads and writes to the module that defines them, so a
   test replacement is visible to every caller. Add a new patchable seam to
   `_SEAMS`, never to the re-export block.
+- `tests/test_module_layout.py` enforces both conventions mechanically: every
+  module is reloaded after everything it imports, every module is in the
+  reload list, and no module exceeds 800 lines. Reload-order mistakes
+  otherwise pass tests silently.
 
-Other key files: `app/index.html` (single-page portal), `tests/` (seventeen files;
+Other key files: `app/index.html` (single-page portal), `tests/` (nineteen files;
 `test_workspaces.py` exports the `WorkspaceHttpCase` live-HTTP harness),
 `docs/index.html` + `docs/openapi.yaml` (separate docs site), `scripts/`
 (backup/restore/preflight).
@@ -349,14 +353,20 @@ Ordering in the route is deliberate: validate → call the provider → parse �
 *then* one transaction that charges one credit per draft and writes
 everything. A plan that fails to parse is never charged for.
 
-### D3 · AI analytics summarization — P2, M
-`POST /api/workspaces/summary` (admin+): feed `GET /api/workspaces/status`
-data plus the last 30 days of deliveries into the configured text provider
-and return a plain-language summary with observations and suggestions.
-Read-only, one AI credit, output clearly labeled as AI-generated in the
-overview panel.
-**Accept:** mocked-provider test asserting the prompt contains real metrics
-and no secrets; viewer/editor get 403.
+### D3 · AI analytics summarization — **done**
+`POST /api/workspaces/summary` (admin+, one AI credit) returns plain-language
+observations and suggestions, surfaced in the Team overview panel behind an
+explicit **AI-generated** label.
+
+`app/insights.py` now owns `workspace_status()`, which both
+`GET /api/workspaces/status` and the summary prompt use — so the dashboard and
+the summary can never describe different numbers.
+
+**The prompt is built from a fixed list of aggregate counters**, never from
+rows. That is the safety property: a future column on `connections` or `posts`
+cannot silently start leaking into an outbound prompt. A test asserts the
+payload carries real metrics and carries no credential, while the API key
+still appears in the *headers* where it belongs.
 
 ### D4 · Campaign agent design (RFC) — P3, M (needs D1, D2)
 Design doc (`docs/rfcs/0001-campaign-agent.md`) for a multi-step agent:

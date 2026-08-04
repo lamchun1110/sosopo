@@ -227,3 +227,16 @@ def generate_campaign_plan(provider: str, model: str, prompt: str, workspace_id:
     adapter = AI_PROVIDERS[provider].adapter
     endpoint, payload, headers = adapter.build_chat_request(settings, messages, {"model": selected_model, "temperature": 0.6, "max_tokens": 4_000})
     return adapter.parse_chat_response(http_client.request_json(endpoint, payload, headers))
+
+
+def generate_workspace_summary(provider: str, model: str, prompt: str, workspace_id: int | None = None) -> str:
+    """Ask one provider to summarize workspace metrics. Read-only by construction."""
+    settings = ai_provider_settings(provider, workspace_id)
+    selected_model = model.strip() or settings["model"]
+    messages = [
+        {"role": "system", "content": "You are Sosopo's analytics assistant. Summarize the metrics you are given for a workspace administrator. Never invent numbers."},
+        {"role": "user", "content": prompt},
+    ]
+    adapter = AI_PROVIDERS[provider].adapter
+    endpoint, payload, headers = adapter.build_chat_request(settings, messages, {"model": selected_model, "temperature": 0.3, "max_tokens": 900})
+    return adapter.parse_chat_response(http_client.request_json(endpoint, payload, headers))

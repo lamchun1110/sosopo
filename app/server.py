@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 _SUBMODULES = (
     "errors", "config", "database", "security", "http_client", "audit", "workspaces", "plans",
     "invitations", "organizations", "credits", "billing", "brand_voice", "campaigns", "media_storage", "ai_adapters", "ai_providers", "media_jobs", "oauth",
-    "connections", "schema",
+    "connections", "insights", "schema",
     "publishing",
     # Route families last: each mixin imports from the modules above.
     "routes.public", "routes.connections", "routes.posts", "routes.ai", "routes.admin", "routes.media",
@@ -199,6 +199,9 @@ available_ai_providers = _MODULES["ai_providers"].available_ai_providers
 ai_provider_models = _MODULES["ai_providers"].ai_provider_models
 generate_post_copy = _MODULES["ai_providers"].generate_post_copy
 generate_campaign_plan = _MODULES["ai_providers"].generate_campaign_plan
+generate_workspace_summary = _MODULES["ai_providers"].generate_workspace_summary
+workspace_status = _MODULES["insights"].workspace_status
+summary_prompt = _MODULES["insights"].summary_prompt
 parse_campaign_plan = _MODULES["campaigns"].parse_campaign_plan
 planning_prompt = _MODULES["campaigns"].planning_prompt
 workspace_campaigns = _MODULES["campaigns"].workspace_campaigns

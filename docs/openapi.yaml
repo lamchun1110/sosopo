@@ -717,3 +717,10 @@ paths:
       responses:
         '200': { description: Success. }
         default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/summary:
+    post:
+      summary: AI summary of the workspace metrics. Read-only; spends one AI credit.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }

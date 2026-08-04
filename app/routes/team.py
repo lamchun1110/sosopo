@@ -14,27 +14,29 @@ from http import HTTPStatus
 from typing import Any
 
 try:  # package import (tests, `python -m app.server`)
+    from ..ai_providers import generate_workspace_summary
     from ..audit import audit
+    from ..insights import MAX_SUMMARY_LENGTH, summary_prompt, workspace_status
     from ..brand_voice import load_brand_voice, save_brand_voice, validated_profile
-    from ..credits import account_balance, allocate_credits, credits_enforced, funding_chain
+    from ..credits import account_balance, allocate_credits, charge_ai_credit, credits_enforced, funding_chain
     from ..config import EMAIL_PATTERN, INVITATION_SECONDS, MAX_WORKSPACE_NAME_LENGTH, now
-    from ..connections import connection_health
     from ..errors import ProviderError
     from ..database import Record, db, insert_id
     from ..invitations import invitation_url, send_email
-    from ..plans import current_period, enforce_member_limit, plan_limits, usage_amount
-    from ..workspaces import create_workspace, save_workspace_setting, user_workspaces, workspace_membership, workspace_plan, workspace_role_allows, workspace_setting
+    from ..plans import enforce_member_limit, enforce_monthly_quota, record_usage
+    from ..workspaces import create_workspace, save_workspace_setting, user_workspaces, workspace_membership, workspace_role_allows
 except ImportError:  # script import (`python /app/app/server.py`)
+    from ai_providers import generate_workspace_summary
     from audit import audit
+    from insights import MAX_SUMMARY_LENGTH, summary_prompt, workspace_status
     from brand_voice import load_brand_voice, save_brand_voice, validated_profile
-    from credits import account_balance, allocate_credits, credits_enforced, funding_chain
+    from credits import account_balance, allocate_credits, charge_ai_credit, credits_enforced, funding_chain
     from config import EMAIL_PATTERN, INVITATION_SECONDS, MAX_WORKSPACE_NAME_LENGTH, now
-    from connections import connection_health
     from errors import ProviderError
     from database import Record, db, insert_id
     from invitations import invitation_url, send_email
-    from plans import current_period, enforce_member_limit, plan_limits, usage_amount
-    from workspaces import create_workspace, save_workspace_setting, user_workspaces, workspace_membership, workspace_plan, workspace_role_allows, workspace_setting
+    from plans import enforce_member_limit, enforce_monthly_quota, record_usage
+    from workspaces import create_workspace, save_workspace_setting, user_workspaces, workspace_membership, workspace_role_allows
 
 
 def credit_amount(value: object) -> int | None:
@@ -59,27 +61,7 @@ class TeamRoutes:
                 return True
             since = (datetime.now(UTC) - timedelta(days=30)).isoformat()
             with db() as connection:
-                posts = {row["state"]: row["count"] for row in connection.execute("SELECT state, COUNT(*) AS count FROM posts WHERE workspace_id = ? GROUP BY state", (workspace_id,)).fetchall()}
-                deliveries = [dict(row) for row in connection.execute(
-                    "SELECT deliveries.provider, deliveries.status, COUNT(*) AS count FROM deliveries JOIN posts ON posts.id = deliveries.post_id"
-                    " WHERE posts.workspace_id = ? AND deliveries.created_at >= ? GROUP BY deliveries.provider, deliveries.status",
-                    (workspace_id, since),
-                ).fetchall()]
-                accounts = [dict(row) for row in connection.execute("SELECT is_active, token_expires_at FROM connections WHERE workspace_id = ?", (workspace_id,)).fetchall()]
-                members = int(connection.execute("SELECT COUNT(*) AS count FROM workspace_memberships WHERE workspace_id = ?", (workspace_id,)).fetchone()["count"])
-                media_jobs = {row["status"]: row["count"] for row in connection.execute("SELECT status, COUNT(*) AS count FROM media_jobs WHERE workspace_id = ? GROUP BY status", (workspace_id,)).fetchall()}
-                plan = workspace_plan(connection, workspace_id)
-                usage = {
-                    "posts_created": usage_amount(connection, workspace_id, "posts_created"),
-                    "ai_generations": usage_amount(connection, workspace_id, "ai_generations"),
-                    "ai_media": usage_amount(connection, workspace_id, "ai_media"),
-                    "storage_bytes": usage_amount(connection, workspace_id, "storage_bytes", period="total"),
-                }
-                cap = workspace_setting(connection, workspace_id, "ai_monthly_cap")
-            health = {"active": 0, "expiring_soon": 0, "expired": 0, "disabled": 0}
-            for account in accounts:
-                health[connection_health(account)] += 1
-            self._json({"plan": plan, "limits": plan_limits(plan), "usage": usage, "ai_monthly_cap": int(cap) if cap is not None else None, "posts": posts, "deliveries_30d": deliveries, "connection_health": health, "members": members, "media_jobs": media_jobs, "period": current_period()})
+                self._json(workspace_status(connection, workspace_id, since))
             return True
         if path == "/api/workspaces/export":
             session = self._session()
@@ -167,6 +149,23 @@ class TeamRoutes:
                 connection.execute("UPDATE sessions SET active_workspace_id = ? WHERE id = ?", (workspace_id, session["id"]))
             audit(session["user_id"], "workspace.created", "workspace", workspace_id, f"Created workspace {name}", self._source_ip(), workspace_id=workspace_id)
             self._json({"id": workspace_id, "name": name, "role": "owner"}, HTTPStatus.CREATED); return True
+        if path == "/api/workspaces/summary":
+            workspace_id = self._require_workspace(session, "admin")
+            if workspace_id is None:
+                return True
+            since = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+            with db() as connection:
+                enforce_monthly_quota(connection, workspace_id, "ai_generations", "ai_generations_per_month", "AI text generations")
+                charge_ai_credit(connection, workspace_id, "ai_summary", session["user_id"])
+                status = workspace_status(connection, workspace_id, since)
+            try:
+                summary = generate_workspace_summary(str(payload.get("provider", "")).strip(), str(payload.get("model", "")).strip(), summary_prompt(status), workspace_id)
+            except ProviderError as error:
+                self._json({"error": str(error)}, HTTPStatus.BAD_GATEWAY); return True
+            with db() as connection:
+                record_usage(connection, workspace_id, "ai_generations")
+            audit(session["user_id"], "workspace.summarized", "workspace", workspace_id, "Generated an AI workspace summary", self._source_ip(), workspace_id=workspace_id)
+            self._json({"summary": summary[:MAX_SUMMARY_LENGTH], "ai_generated": True, "period": status["period"]}); return True
         if path == "/api/workspaces/brand-voice":
             workspace_id = self._require_workspace(session, "admin")
             if workspace_id is None:
