@@ -15,6 +15,7 @@ try:  # package import (tests, `python -m app.server`)
     from ..config import CHANNELS
     from ..database import Record, db
     from ..errors import ProviderError
+    from ..brand_voice import load_brand_voice
     from ..credits import charge_ai_credit
     from ..plans import enforce_monthly_quota, record_usage
 except ImportError:  # script import (`python /app/app/server.py`)
@@ -23,6 +24,7 @@ except ImportError:  # script import (`python /app/app/server.py`)
     from config import CHANNELS
     from database import Record, db
     from errors import ProviderError
+    from brand_voice import load_brand_voice
     from credits import charge_ai_credit
     from plans import enforce_monthly_quota, record_usage
 
@@ -123,11 +125,15 @@ class AiRoutes:
             channels = payload.get("channels", [])
             if not isinstance(channels, list) or any(str(channel) not in CHANNELS for channel in channels):
                 self._json({"error": "Choose valid post platforms for AI generation."}, HTTPStatus.BAD_REQUEST); return True
+            # The toggle defaults on, so a saved profile applies unless the
+            # composer explicitly opts out for this one generation.
+            apply_brand_voice = payload.get("apply_brand_voice", True) is not False
             with db() as connection:
                 enforce_monthly_quota(connection, workspace_id, "ai_generations", "ai_generations_per_month", "AI text generations")
                 charge_ai_credit(connection, workspace_id, "ai_generation", session["user_id"])
+                brand_voice = load_brand_voice(connection, workspace_id) if apply_brand_voice else None
             try:
-                copy = generate_post_copy(provider, model, instruction, draft, [str(channel) for channel in channels], workspace_id)
+                copy = generate_post_copy(provider, model, instruction, draft, [str(channel) for channel in channels], workspace_id, brand_voice)
             except ProviderError as error:
                 self._json({"error": str(error)}, HTTPStatus.BAD_GATEWAY); return True
             with db() as connection:

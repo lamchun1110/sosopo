@@ -15,6 +15,7 @@ from typing import Any
 
 try:  # package import (tests, `python -m app.server`)
     from ..audit import audit
+    from ..brand_voice import load_brand_voice, save_brand_voice, validated_profile
     from ..credits import account_balance, allocate_credits, credits_enforced, funding_chain
     from ..config import EMAIL_PATTERN, INVITATION_SECONDS, MAX_WORKSPACE_NAME_LENGTH, now
     from ..connections import connection_health
@@ -22,9 +23,10 @@ try:  # package import (tests, `python -m app.server`)
     from ..database import Record, db, insert_id
     from ..invitations import invitation_url, send_email
     from ..plans import current_period, enforce_member_limit, plan_limits, usage_amount
-    from ..workspaces import create_workspace, save_workspace_setting, user_workspaces, workspace_membership, workspace_plan, workspace_setting
+    from ..workspaces import create_workspace, save_workspace_setting, user_workspaces, workspace_membership, workspace_plan, workspace_role_allows, workspace_setting
 except ImportError:  # script import (`python /app/app/server.py`)
     from audit import audit
+    from brand_voice import load_brand_voice, save_brand_voice, validated_profile
     from credits import account_balance, allocate_credits, credits_enforced, funding_chain
     from config import EMAIL_PATTERN, INVITATION_SECONDS, MAX_WORKSPACE_NAME_LENGTH, now
     from connections import connection_health
@@ -32,7 +34,7 @@ except ImportError:  # script import (`python /app/app/server.py`)
     from database import Record, db, insert_id
     from invitations import invitation_url, send_email
     from plans import current_period, enforce_member_limit, plan_limits, usage_amount
-    from workspaces import create_workspace, save_workspace_setting, user_workspaces, workspace_membership, workspace_plan, workspace_setting
+    from workspaces import create_workspace, save_workspace_setting, user_workspaces, workspace_membership, workspace_plan, workspace_role_allows, workspace_setting
 
 
 def credit_amount(value: object) -> int | None:
@@ -102,6 +104,14 @@ class TeamRoutes:
             self.end_headers()
             self.wfile.write(body)
             return True
+        if path == "/api/workspaces/brand-voice":
+            session = self._session()
+            workspace_id = self._require_workspace(session)
+            if workspace_id is None:
+                return True
+            with db() as connection:
+                profile = load_brand_voice(connection, workspace_id)
+            self._json({"profile": profile, "configured": profile is not None, "editable": workspace_role_allows(session["workspace_role"], "admin")}); return True
         if path == "/api/workspaces/credits":
             session = self._session()
             workspace_id = self._require_workspace(session)
@@ -157,6 +167,17 @@ class TeamRoutes:
                 connection.execute("UPDATE sessions SET active_workspace_id = ? WHERE id = ?", (workspace_id, session["id"]))
             audit(session["user_id"], "workspace.created", "workspace", workspace_id, f"Created workspace {name}", self._source_ip(), workspace_id=workspace_id)
             self._json({"id": workspace_id, "name": name, "role": "owner"}, HTTPStatus.CREATED); return True
+        if path == "/api/workspaces/brand-voice":
+            workspace_id = self._require_workspace(session, "admin")
+            if workspace_id is None:
+                return True
+            raw = payload.get("profile")
+            profile = None if raw in (None, {}) else validated_profile(raw)
+            with db() as connection:
+                save_brand_voice(connection, workspace_id, profile)
+            audit(session["user_id"], "workspace.brand_voice_saved", "workspace", workspace_id,
+                  "Saved the brand voice profile" if profile else "Cleared the brand voice profile", self._source_ip(), workspace_id=workspace_id)
+            self._json({"profile": profile, "configured": profile is not None}); return True
         if path == "/api/workspaces/credits/allocate":
             workspace_id = self._require_workspace(session, "admin")
             if workspace_id is None:

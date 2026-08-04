@@ -27,12 +27,12 @@ All six phases of ROADMAP.md are complete and deployed:
 - `GET /api/workspaces/status` dashboard data, audited metadata-only
   `GET /api/admin/workspaces`, media/workspace Prometheus gauges (Phase 6).
 
-Suite: 196 tests, all passing (1 skipped without PyYAML).
+Suite: 210 tests, all passing (1 skipped without PyYAML).
 
 `app/` is split into focused modules (A1). Dependency order, which is also the
 reload order in `app/server.py`: `errors` → `config` → `database` → `security`
 → `http_client` → `audit` → `workspaces` → `plans` → `billing` →
-`invitations` → `organizations` → `credits` → `media_storage` → `ai_adapters` → `ai_providers` →
+`invitations` → `organizations` → `credits` → `brand_voice` → `media_storage` → `ai_adapters` → `ai_providers` →
 `media_jobs` → `oauth` → `connections` → `schema` → `publishing`.
 `app/routes/` then holds the ten HTTP route-family mixins (A1b, B1), which import
 from the modules above and are reloaded after them. `app/server.py` holds the
@@ -57,7 +57,7 @@ Two conventions exist because the test suite calls
   test replacement is visible to every caller. Add a new patchable seam to
   `_SEAMS`, never to the re-export block.
 
-Other key files: `app/index.html` (single-page portal), `tests/` (fifteen files;
+Other key files: `app/index.html` (single-page portal), `tests/` (sixteen files;
 `test_workspaces.py` exports the `WorkspaceHttpCase` live-HTTP harness),
 `docs/index.html` + `docs/openapi.yaml` (separate docs site), `scripts/`
 (backup/restore/preflight).
@@ -310,14 +310,24 @@ C3/C4 needed one line each is the C1 seam doing its job.
 
 ## D. AI marketing capabilities
 
-### D1 · Brand voice profiles — P1, M
-Per-workspace brand profile (tone, audience, do/don't phrases, sample posts,
-default hashtags; ≤4 KB) stored in `workspace_settings` as plain JSON, edited
-by workspace admins in the AI tab, and injected as system-prompt context into
-`generate_post_copy` and media `media_job_prompt` (style hint). A composer
-toggle ("Apply brand voice", default on when a profile exists).
-**Accept:** HTTP tests: only admins edit; prompt injection verified via
-captured mock payloads; generation without a profile unchanged.
+### D1 · Brand voice profiles — **done**
+`app/brand_voice.py` validates and renders the profile; it lives as plain JSON
+in `workspace_settings` (no migration). `GET /api/workspaces/brand-voice`
+(any member, reports `editable`) and `POST` (admin only, `null` clears).
+
+Injected in two places: as labelled context appended to the system prompt in
+`generate_post_copy`, and as a `Brand style:` line in `media_job_prompt`. An
+explicit per-job media style is kept *alongside* the brand style rather than
+replaced. The composer toggle defaults on whenever a profile exists.
+
+Because this is user-authored text that lands in a system prompt, two
+properties are enforced and tested: **only known fields survive**
+(`validated_profile` rebuilds from a fixed field list, so an extra key cannot
+be smuggled into the prompt), and **everything is bounded** (per-field caps
+plus a 4 KB total). The profile is rendered as description, not as
+instructions.
+
+Generation with no profile is byte-for-byte unchanged — there is a test.
 
 ### D2 · AI content calendar generation — P1, L (better after D1)
 "Plan my week": editor supplies a brief, cadence, and target channels; the AI

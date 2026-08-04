@@ -111,6 +111,12 @@ SOSOPO_AI_KIMI_BASE_URL=https://provider.example/v1
 SOSOPO_AI_KIMI_MODEL=your-model-id
 ```
 
+### Brand voice
+
+Each workspace can save a **brand voice** profile in the AI providers tab: tone, audience, preferred and forbidden phrases, example posts, default hashtags, and a visual style. Workspace admins edit it; editors see it. Sosopo adds the profile as labelled context to the system prompt for generated copy, and appends the visual style to generated media prompts. The composer shows an **Apply brand voice** toggle, on by default whenever a profile exists, so a one-off post can ignore it.
+
+The profile is stored as plain JSON in workspace settings and is capped at 4 KB. Only known fields are kept — an unrecognized key is dropped rather than stored, so nothing extra can be smuggled into the prompt.
+
 The composer sends the user's brief, selected destinations, and optional draft to the configured provider, then puts returned copy into the editor for review; it never publishes automatically. API keys remain server-side and are not returned to browsers. OpenRouter documents its OpenAI-compatible `chat/completions` endpoint and model catalog in its [quickstart](https://openrouter.ai/docs/quickstart).
 
 OpenClaw’s OpenAI OAuth uses its bundled Codex runtime and a ChatGPT/Codex subscription, while its MiniMax OAuth uses a provider-specific Coding Plan plugin. Those are not interchangeable with the public, server-to-server generation APIs used by Sosopo. Sosopo therefore uses direct provider API keys: this is the public authentication method documented by [OpenAI](https://platform.openai.com/docs/api-reference/backward-compatibility), [MiniMax](https://platform.minimax.io/docs/faq/about-apis), and [Z.AI](https://docs.z.ai/api-reference/introduction). OpenClaw’s separate OAuth routes are described in its [OpenAI provider guide](https://github.com/openclaw/openclaw/blob/main/docs/providers/openai.md) and [MiniMax provider guide](https://docs.openclaw.ai/providers/minimax).

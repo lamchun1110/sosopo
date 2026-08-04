@@ -7,6 +7,7 @@ from typing import NamedTuple
 
 try:  # package import (tests, `python -m app.server`)
     from . import http_client
+    from .brand_voice import brand_voice_prompt
     from .ai_adapters import ChatAdapter, ClaudeAdapter, MiniMaxAdapter, OpenRouterAdapter
     from .config import config, now
     from .database import db
@@ -15,6 +16,7 @@ try:  # package import (tests, `python -m app.server`)
     from .workspaces import save_workspace_setting
 except ImportError:  # script import (`python /app/app/server.py`)
     import http_client
+    from brand_voice import brand_voice_prompt
     from ai_adapters import ChatAdapter, ClaudeAdapter, MiniMaxAdapter, OpenRouterAdapter
     from config import config, now
     from database import db
@@ -190,7 +192,7 @@ def ai_provider_models(provider: str, workspace_id: int | None = None) -> list[s
     return models
 
 
-def generate_post_copy(provider: str, model: str, instruction: str, draft: str, channels: list[str], workspace_id: int | None = None) -> str:
+def generate_post_copy(provider: str, model: str, instruction: str, draft: str, channels: list[str], workspace_id: int | None = None, brand_voice: dict | None = None) -> str:
     settings = ai_provider_settings(provider, workspace_id)
     selected_model = model.strip() or settings["model"]
     stored, _ = effective_ai_provider_stored(provider, workspace_id)
@@ -200,7 +202,9 @@ def generate_post_copy(provider: str, model: str, instruction: str, draft: str, 
     if len(selected_model) > 200 or len(instruction) > 2_000 or len(draft) > 5_000:
         raise ProviderError("AI request is too long.", retryable=False)
     prompt = f"Write one ready-to-publish social media post. Platforms: {', '.join(channels) or 'general social media'}. Brief: {instruction.strip() or 'Improve the draft below.'}\nDraft to improve (may be empty):\n{draft.strip()}"
-    messages = [{"role": "system", "content": "You are Sosopo's concise social-media copywriter. Return only the finished post copy; do not add a title, explanation, markdown fence, or quotation marks."}, {"role": "user", "content": prompt}]
+    instructions = "You are Sosopo's concise social-media copywriter. Return only the finished post copy; do not add a title, explanation, markdown fence, or quotation marks."
+    voice = brand_voice_prompt(brand_voice)
+    messages = [{"role": "system", "content": f"{instructions}\n\n{voice}" if voice else instructions}, {"role": "user", "content": prompt}]
     adapter = AI_PROVIDERS[provider].adapter
     endpoint, payload, headers = adapter.build_chat_request(settings, messages, {"model": selected_model, "temperature": 0.7, "max_tokens": 700})
     return adapter.parse_chat_response(http_client.request_json(endpoint, payload, headers))

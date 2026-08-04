@@ -587,6 +587,19 @@ paths:
       responses:
         '200': { description: Success. }
         default: { $ref: '#/components/responses/Error' }
+  /api/workspaces/brand-voice:
+    get:
+      summary: The workspace brand voice profile, and whether the caller may edit it.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      summary: Save or clear the workspace brand voice profile. Admin only.
+      security: [{ sessionCookie: [], csrfToken: [] }]
+      responses:
+        '200': { description: Success. }
+        default: { $ref: '#/components/responses/Error' }
   /api/workspaces/credits:
     get:
       summary: Accounts funding the caller's AI actions, in resolution order.

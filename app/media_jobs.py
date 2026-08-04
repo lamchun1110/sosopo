@@ -12,6 +12,7 @@ from urllib.parse import quote
 try:  # package import (tests, `python -m app.server`)
     from . import config as cfg
     from . import http_client
+    from .brand_voice import brand_voice_style, load_brand_voice
     from .ai_providers import AI_PROVIDER_IMAGE_MODELS, AI_PROVIDER_VIDEO_MODELS, ai_provider_settings
     from .config import IMAGE_TYPES, LOGGER, MEDIA_IMAGE_SIZES, MEDIA_VIDEO_SIZES, POLL_SECONDS, VIDEO_POLL_LIMIT, now
     from .database import Record, db
@@ -22,6 +23,7 @@ try:  # package import (tests, `python -m app.server`)
 except ImportError:  # script import (`python /app/app/server.py`)
     import config as cfg
     import http_client
+    from brand_voice import brand_voice_style, load_brand_voice
     from ai_providers import AI_PROVIDER_IMAGE_MODELS, AI_PROVIDER_VIDEO_MODELS, ai_provider_settings
     from config import IMAGE_TYPES, LOGGER, MEDIA_IMAGE_SIZES, MEDIA_VIDEO_SIZES, POLL_SECONDS, VIDEO_POLL_LIMIT, now
     from database import Record, db
@@ -37,9 +39,20 @@ def default_media_model(provider: str, kind: str) -> str:
 
 
 def media_job_prompt(job: dict[str, Any]) -> str:
+    """Build the provider prompt: the brief, an explicit style, then brand style.
+
+    An explicit per-job style is kept rather than replaced, so a one-off
+    request can steer the image without editing the workspace profile.
+    """
+    parts = [str(job["prompt"]).strip()]
     style = str(job.get("style") or "").strip()
-    prompt = str(job["prompt"]).strip()
-    return f"{prompt}\n\nVisual style: {style}" if style else prompt
+    if style:
+        parts.append(f"Visual style: {style}")
+    with db() as connection:
+        brand_style = brand_voice_style(load_brand_voice(connection, job.get("workspace_id")))
+    if brand_style:
+        parts.append(f"Brand style: {brand_style}")
+    return "\n\n".join(parts)
 
 
 def store_generated_media(job: dict[str, Any], content: bytes, content_type: str, suffix: str) -> str:

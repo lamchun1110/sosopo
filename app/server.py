@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 # it depends on have themselves been reloaded.
 _SUBMODULES = (
     "errors", "config", "database", "security", "http_client", "audit", "workspaces", "plans",
-    "invitations", "organizations", "credits", "billing", "media_storage", "ai_adapters", "ai_providers", "media_jobs", "oauth",
+    "invitations", "organizations", "credits", "billing", "brand_voice", "media_storage", "ai_adapters", "ai_providers", "media_jobs", "oauth",
     "connections", "schema",
     "publishing",
     # Route families last: each mixin imports from the modules above.
@@ -235,6 +235,12 @@ worker_healthy = _MODULES["publishing"].worker_healthy
 recover_stale_deliveries = _MODULES["publishing"].recover_stale_deliveries
 scheduler = _MODULES["publishing"].scheduler
 
+
+load_brand_voice = _MODULES["brand_voice"].load_brand_voice
+save_brand_voice = _MODULES["brand_voice"].save_brand_voice
+validated_profile = _MODULES["brand_voice"].validated_profile
+brand_voice_prompt = _MODULES["brand_voice"].brand_voice_prompt
+brand_voice_style = _MODULES["brand_voice"].brand_voice_style
 
 CREDIT_OWNER_TYPES = _MODULES["credits"].CREDIT_OWNER_TYPES
 credits_enforced = _MODULES["credits"].credits_enforced
