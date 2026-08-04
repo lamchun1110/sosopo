@@ -27,7 +27,7 @@ All six phases of ROADMAP.md are complete and deployed:
 - `GET /api/workspaces/status` dashboard data, audited metadata-only
   `GET /api/admin/workspaces`, media/workspace Prometheus gauges (Phase 6).
 
-Suite: 137 tests, all passing.
+Suite: 157 tests, all passing.
 
 `app/` is split into focused modules (A1). Dependency order, which is also the
 reload order in `app/server.py`: `errors` → `config` → `database` → `security`
@@ -56,7 +56,7 @@ Two conventions exist because the test suite calls
   test replacement is visible to every caller. Add a new patchable seam to
   `_SEAMS`, never to the re-export block.
 
-Other key files: `app/index.html` (single-page portal), `tests/` (nine files;
+Other key files: `app/index.html` (single-page portal), `tests/` (ten files;
 `test_workspaces.py` exports the `WorkspaceHttpCase` live-HTTP harness),
 `docs/index.html` (separate docs site), `scripts/`
 (backup/restore/preflight).
@@ -199,15 +199,28 @@ ai_media_per_month`), topped up lazily on first charge in a new period rather
 than by a scheduled job. `usage_records` still carries analytics: usage is a
 counter that may be reset, the ledger is an audit trail that may not.
 
-### B3 · Hierarchical credit allocation — P1, M (needs B1 + B2)
-Org can allocate credits to workspaces or directly to users; a workspace can
-allocate to users. Unused credits remain with the owner unless explicitly
-transferred; transfers are transactions (paired debit/credit rows) and
-auditable via the audit log. Endpoints: `POST /api/organizations/credits/
-allocate`, workspace equivalent, plus balance listing. Resolution order when
-debiting a user's AI action: user account → workspace account → org account.
-**Accept:** HTTP tests for allocation permission rules, resolution order, and
-audit trail; no cross-org leakage.
+### B3 · Hierarchical credit allocation — **done**
+`allocate_credits()` moves credits between accounts as a paired
+`allocation_out`/`allocation_in`; the debit runs first, so an over-allocation
+raises before the target is credited and the ledger never holds half a
+transfer. Every allocation also writes a `credits.allocated` audit event.
+
+`funding_chain()` gives the resolution order for a debit — **user → workspace
+→ organization** — and `charge_ai_credit()` spends from the first account in
+that chain with a positive balance, returning which one paid. `media_jobs`
+carries a `credit_account_id` so a failed job refunds *exactly* the account
+that paid, not merely the workspace.
+
+Endpoints (paths deviate from the original task text to carry the org id,
+matching the rest of the organization API):
+`POST /api/organizations/<id>/credits/allocate`, `GET
+/api/organizations/<id>/credits` (org admin: org, per-workspace, and
+per-member balances), `POST /api/workspaces/credits/allocate` (workspace
+admin, members only), `GET /api/workspaces/credits` (any member: the accounts
+that fund their own actions, in resolution order).
+
+Allocation targets are checked for ownership, so credits cannot cross into
+another organization's workspace or fund a non-member.
 
 ### B4 · Stripe credit top-ups — P2, M (needs B2)
 One-time Checkout purchases (`mode=payment`) crediting an org or workspace

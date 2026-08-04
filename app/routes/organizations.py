@@ -5,8 +5,15 @@ from __future__ import annotations
 from http import HTTPStatus
 from typing import Any
 
+
+def credit_amount(value: object) -> int | None:
+    """Accept only a positive whole number; reject floats, text, and negatives."""
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
 try:  # package import (tests, `python -m app.server`)
     from ..audit import audit
+    from ..credits import account_balance, allocate_credits, credits_enforced
+    from ..errors import ProviderError
     from ..config import MAX_WORKSPACE_NAME_LENGTH
     from ..database import Record, db
     from ..organizations import (
@@ -23,6 +30,8 @@ try:  # package import (tests, `python -m app.server`)
     from ..workspaces import create_workspace
 except ImportError:  # script import (`python /app/app/server.py`)
     from audit import audit
+    from credits import account_balance, allocate_credits, credits_enforced
+    from errors import ProviderError
     from config import MAX_WORKSPACE_NAME_LENGTH
     from database import Record, db
     from organizations import (
@@ -93,6 +102,18 @@ class OrganizationRoutes:
                     for item in organization_workspaces(connection, int(membership["organization_id"]))
                 ]
             self._json({"workspaces": workspaces}); return True
+        if path.startswith("/api/organizations/") and path.endswith("/credits"):
+            membership = self._require_organization(path, "admin")
+            if membership is None:
+                return True
+            organization_id = int(membership["organization_id"])
+            with db() as connection:
+                balance = account_balance(connection, "organization", organization_id)
+                workspaces = [{"id": item["id"], "name": item["name"], "balance": account_balance(connection, "workspace", int(item["id"]))}
+                              for item in organization_workspaces(connection, organization_id)]
+                members = [{"user_id": item["user_id"], "username": item["username"], "balance": account_balance(connection, "user", int(item["user_id"]))}
+                           for item in organization_members(connection, organization_id)]
+            self._json({"enforced": credits_enforced(), "balance": balance, "workspaces": workspaces, "members": members}); return True
         if path.startswith("/api/organizations/") and path.endswith("/members"):
             membership = self._require_organization(path)
             if membership is None:
@@ -130,6 +151,31 @@ class OrganizationRoutes:
                 created = connection.execute("SELECT id, name, slug FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
             audit(session["user_id"], "organization.workspace_created", "workspace", workspace_id, f"Created workspace {name} in organization {organization_id}", self._source_ip(), workspace_id=workspace_id)
             self._json({"id": created["id"], "name": created["name"], "slug": created["slug"], "organization_id": organization_id, "role": "owner"}, HTTPStatus.CREATED); return True
+        if path.startswith("/api/organizations/") and path.endswith("/credits/allocate"):
+            membership = self._require_organization(path, "admin")
+            if membership is None:
+                return True
+            organization_id = int(membership["organization_id"])
+            target_type = str(payload.get("target_type", "")).strip()
+            if target_type not in {"workspace", "user"}:
+                self._json({"error": "Allocate to a workspace or a user."}, HTTPStatus.BAD_REQUEST); return True
+            amount, target_id = credit_amount(payload.get("amount")), credit_amount(payload.get("target_id"))
+            if amount is None or target_id is None:
+                self._json({"error": "Use a positive whole number of credits and a valid target."}, HTTPStatus.BAD_REQUEST); return True
+            with db() as connection:
+                if target_type == "workspace":
+                    owned = connection.execute("SELECT 1 FROM workspaces WHERE id = ? AND organization_id = ?", (target_id, organization_id)).fetchone()
+                else:
+                    owned = connection.execute("SELECT 1 FROM organization_memberships WHERE user_id = ? AND organization_id = ?", (target_id, organization_id)).fetchone()
+                if owned is None:
+                    self._json({"error": "Not found."}, HTTPStatus.NOT_FOUND); return True
+                try:
+                    allocate_credits(connection, ("organization", organization_id), (target_type, target_id), amount, session["user_id"])
+                except ProviderError as error:
+                    self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST); return True
+                balance = account_balance(connection, "organization", organization_id)
+            audit(session["user_id"], "credits.allocated", "organization", organization_id, f"Allocated {amount} credits to {target_type} {target_id}", self._source_ip())
+            self._json({"balance": balance, "target_type": target_type, "target_id": target_id, "amount": amount}); return True
         if path.startswith("/api/organizations/") and path.endswith("/members"):
             membership = self._require_organization(path, "admin")
             if membership is None:

@@ -105,11 +105,11 @@ class MediaRoutes:
                 self._json({"error": f"{provider} has no supported {kind} model in Sosopo. Choose another provider or set a model explicitly."}, HTTPStatus.BAD_REQUEST); return True
             with db() as connection:
                 enforce_monthly_quota(connection, workspace_id, "ai_media", "ai_media_per_month", "AI media generations")
-                charge_ai_credit(connection, workspace_id, "ai_media", session["user_id"])
+                account_id = charge_ai_credit(connection, workspace_id, "ai_media", session["user_id"])
                 record_usage(connection, workspace_id, "ai_media")
                 job_id = insert_id(connection,
-                    "INSERT INTO media_jobs (workspace_id, user_id, kind, prompt, aspect_ratio, style, provider, model, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
-                    (workspace_id, session["user_id"], kind, prompt, aspect, style, provider, model, now(), now()),
+                    "INSERT INTO media_jobs (workspace_id, user_id, kind, prompt, aspect_ratio, style, provider, model, status, credit_account_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
+                    (workspace_id, session["user_id"], kind, prompt, aspect, style, provider, model, account_id, now(), now()),
                 )
             audit(session["user_id"], "media.job_created", "media_job", job_id, f"Queued {kind} generation with {provider}", self._source_ip(), workspace_id=workspace_id)
             self._json({"id": job_id, "status": "queued", "provider": provider}, HTTPStatus.CREATED); return True

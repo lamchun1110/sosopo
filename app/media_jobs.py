@@ -125,7 +125,7 @@ def run_media_job(job: dict[str, Any]) -> None:
     with db() as connection:
         connection.execute("UPDATE media_jobs SET status = 'failed', error = ?, updated_at = ? WHERE id = ?", (detail, now(), job["id"]))
         record_usage(connection, int(job["workspace_id"]), "ai_media", -1)
-        refund_ai_credit(connection, int(job["workspace_id"]), "ai_media_refund", job.get("user_id"))
+        refund_ai_credit(connection, job.get("credit_account_id"), "ai_media_refund", job.get("user_id"))
 
 
 def media_worker() -> None:

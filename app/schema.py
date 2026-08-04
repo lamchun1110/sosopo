@@ -311,6 +311,7 @@ def setup_database() -> None:
             )""" % id_column
         )
         connection.execute("CREATE INDEX IF NOT EXISTS credit_transactions_account ON credit_transactions(account_id, id)")
+        add_table_column(connection, "media_jobs", "credit_account_id", "INTEGER")
         connection.execute("CREATE INDEX IF NOT EXISTS organization_memberships_user ON organization_memberships(user_id)")
         connection.execute("CREATE INDEX IF NOT EXISTS workspaces_organization ON workspaces(organization_id)")
         connection.execute("CREATE INDEX IF NOT EXISTS posts_workspace ON posts(workspace_id, state)")

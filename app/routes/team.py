@@ -15,20 +15,29 @@ from typing import Any
 
 try:  # package import (tests, `python -m app.server`)
     from ..audit import audit
+    from ..credits import account_balance, allocate_credits, credits_enforced, funding_chain
     from ..config import EMAIL_PATTERN, INVITATION_SECONDS, MAX_WORKSPACE_NAME_LENGTH, now
     from ..connections import connection_health
+    from ..errors import ProviderError
     from ..database import Record, db, insert_id
     from ..invitations import invitation_url, send_email
     from ..plans import current_period, enforce_member_limit, plan_limits, usage_amount
-    from ..workspaces import create_workspace, save_workspace_setting, user_workspaces, workspace_plan, workspace_setting
+    from ..workspaces import create_workspace, save_workspace_setting, user_workspaces, workspace_membership, workspace_plan, workspace_setting
 except ImportError:  # script import (`python /app/app/server.py`)
     from audit import audit
+    from credits import account_balance, allocate_credits, credits_enforced, funding_chain
     from config import EMAIL_PATTERN, INVITATION_SECONDS, MAX_WORKSPACE_NAME_LENGTH, now
     from connections import connection_health
+    from errors import ProviderError
     from database import Record, db, insert_id
     from invitations import invitation_url, send_email
     from plans import current_period, enforce_member_limit, plan_limits, usage_amount
-    from workspaces import create_workspace, save_workspace_setting, user_workspaces, workspace_plan, workspace_setting
+    from workspaces import create_workspace, save_workspace_setting, user_workspaces, workspace_membership, workspace_plan, workspace_setting
+
+
+def credit_amount(value: object) -> int | None:
+    """Accept only a positive whole number; reject floats, text, and negatives."""
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
 class TeamRoutes:
@@ -93,6 +102,15 @@ class TeamRoutes:
             self.end_headers()
             self.wfile.write(body)
             return True
+        if path == "/api/workspaces/credits":
+            session = self._session()
+            workspace_id = self._require_workspace(session)
+            if workspace_id is None:
+                return True
+            with db() as connection:
+                accounts = [{"owner_type": owner_type, "owner_id": owner_id, "balance": account_balance(connection, owner_type, owner_id)}
+                            for owner_type, owner_id in funding_chain(connection, workspace_id, session["user_id"])]
+            self._json({"enforced": credits_enforced(), "accounts": accounts}); return True
         if path == "/api/workspaces":
             session = self._session()
             with db() as connection:
@@ -139,6 +157,23 @@ class TeamRoutes:
                 connection.execute("UPDATE sessions SET active_workspace_id = ? WHERE id = ?", (workspace_id, session["id"]))
             audit(session["user_id"], "workspace.created", "workspace", workspace_id, f"Created workspace {name}", self._source_ip(), workspace_id=workspace_id)
             self._json({"id": workspace_id, "name": name, "role": "owner"}, HTTPStatus.CREATED); return True
+        if path == "/api/workspaces/credits/allocate":
+            workspace_id = self._require_workspace(session, "admin")
+            if workspace_id is None:
+                return True
+            amount, target_id = credit_amount(payload.get("amount")), credit_amount(payload.get("target_id"))
+            if amount is None or target_id is None:
+                self._json({"error": "Use a positive whole number of credits and a valid member."}, HTTPStatus.BAD_REQUEST); return True
+            with db() as connection:
+                if workspace_membership(connection, workspace_id, target_id) is None:
+                    self._json({"error": "Not found."}, HTTPStatus.NOT_FOUND); return True
+                try:
+                    allocate_credits(connection, ("workspace", workspace_id), ("user", target_id), amount, session["user_id"])
+                except ProviderError as error:
+                    self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST); return True
+                balance = account_balance(connection, "workspace", workspace_id)
+            audit(session["user_id"], "credits.allocated", "workspace", workspace_id, f"Allocated {amount} credits to user {target_id}", self._source_ip(), workspace_id=workspace_id)
+            self._json({"balance": balance, "target_type": "user", "target_id": target_id, "amount": amount}); return True
         if path == "/api/workspaces/members":
             workspace_id = self._require_workspace(session, "admin")
             if workspace_id is None:
